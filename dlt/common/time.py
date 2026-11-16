@@ -3,7 +3,18 @@ import math
 import os
 import re
 import sys
-from typing import Any, Dict, Optional, Tuple, Union, overload, TypeVar, Callable  # noqa
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Literal,
+    NamedTuple,
+    Optional,
+    Tuple,
+    TypeVar,
+    Union,
+    overload,
+)
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError, available_timezones
 
 from pendulum.parsing import (
@@ -14,7 +25,7 @@ from pendulum.parsing import (
 from pendulum import DateTime, Date, Time  # noqa: I251
 
 from dlt.common import known_env
-from dlt.common.exceptions import TerminalValueError
+from dlt.common.exceptions import TerminalValueError, ValueErrorWithKnownValues
 from dlt.common.pendulum import create_dt, ensure_pendulum_dt, pendulum, timedelta
 from dlt.common.typing import TimedeltaSeconds, TAnyDateTime
 
@@ -27,6 +38,193 @@ UNIX_EPOCH = datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)
 UTC_NAME = "UTC"
 
 DEFAULT_TIMESTAMP_PRECISION = 6
+
+# ambiguity policy of the time fidelity mode, see `resolve_local_time`
+TAmbiguityPolicy = Literal["reject", "flag", "earliest", "latest"]
+TIME_FIDELITY_AMBIGUITY_POLICIES: Tuple[TAmbiguityPolicy, ...] = (
+    "reject",
+    "flag",
+    "earliest",
+    "latest",
+)
+"""Policies for a local wall clock that DST makes either ambiguous or nonexistent."""
+
+T_LOCAL_TIME_STATUS = Literal["ambiguous", "nonexistent"]
+"""Statuses `flag` marks a resolved local wall clock with."""
+
+HINT_SOURCE_TIMEZONE = "x-source-timezone"
+"""Column hint naming the IANA zone a timestamp field is written in."""
+
+HINT_LOCAL_TIME_AMBIGUITY = "x-local-time-ambiguity"
+"""Column hint naming the policy for a wall clock DST makes ambiguous or nonexistent."""
+
+HINT_COMPANION_OF = "x-time-fidelity-of"
+"""Column hint marking a companion column the time fidelity mode generated for a field."""
+
+C_UTC_OFFSET_SUFFIX = "utc_offset"
+"""Name fragment of the column that holds the original offset of a time fidelity field."""
+
+C_TIME_STATUS_SUFFIX = "time_status"
+"""Name fragment of the column that flags an ambiguous or nonexistent local wall clock."""
+
+
+class InvalidLocalTime(TerminalValueError):
+    """A local wall clock that DST makes ambiguous or nonexistent, rejected by policy."""
+
+    def __init__(
+        self,
+        value: datetime.datetime,
+        tz: str,
+        status: str,
+    ) -> None:
+        self.value = value
+        self.tz = tz
+        self.status = status
+        if status == "ambiguous":
+            detail = (
+                f"the wall clock occurs twice in timezone `{tz}` because the clock moved back."
+                " Declare the offset of the source value or set an `x-local-time-ambiguity`"
+                " policy of `earliest`, `latest` or `flag`."
+            )
+        else:
+            detail = (
+                f"the wall clock does not exist in timezone `{tz}` because the clock moved"
+                " forward. Declare the offset of the source value or set an"
+                " `x-local-time-ambiguity` policy of `earliest`, `latest` or `flag`."
+            )
+        super().__init__(f"Local time `{value.isoformat()}` is {status}: {detail}")
+
+
+class LocalTimeResolution(NamedTuple):
+    """A local wall clock resolved to an instant, see `resolve_local_time`."""
+
+    value: datetime.datetime
+    """The wall clock labelled with the declared source zone and the resolved offset."""
+    offset: Optional[datetime.timedelta]
+    """Offset the wall clock was resolved with, `None` when the instant was not written out."""
+    status: Optional[T_LOCAL_TIME_STATUS]
+    """`ambiguous` or `nonexistent` when the wall clock fell into the repeated hour or the gap,
+    `None` for a value that maps to exactly one instant or for an instant that was written out
+    with an offset."""
+    candidate_offsets: Tuple[datetime.timedelta, ...]
+    """Offsets the wall clock could be read with: empty when it maps to one instant, the two
+    readings of the repeated hour (`fold=0` first) when ambiguous and the offsets before and after
+    the gap when nonexistent."""
+
+
+def validate_ambiguity_policy(
+    policy: Optional[str], key: str = "x-local-time-ambiguity"
+) -> TAmbiguityPolicy:
+    """Validates and returns `policy`, `flag` when it is not set."""
+    if policy is None or policy == "":
+        return "flag"
+    if policy not in TIME_FIDELITY_AMBIGUITY_POLICIES:
+        raise ValueErrorWithKnownValues(key, policy, TIME_FIDELITY_AMBIGUITY_POLICIES)
+    return policy  # type: ignore[return-value]
+
+
+def _wall_clock_offset(
+    wall: datetime.datetime, tz: datetime.tzinfo, fold: int
+) -> Tuple[datetime.timedelta, datetime.datetime]:
+    """Offset `wall` is read with under `fold`, and the wall clock its instant maps back to."""
+    # `fold` is only honored when attached to a naive value; `replace` on an aware one drops it
+    aware = wall.replace(tzinfo=None, fold=fold).replace(tzinfo=tz)
+    # `astimezone(tz)` off an aware value is the identity, so the round trip must go through UTC
+    back = aware.astimezone(datetime.timezone.utc).astimezone(tz).replace(tzinfo=None)
+    return aware.utcoffset(), back
+
+
+def _classify_wall_clock(
+    wall: datetime.datetime, tz: datetime.tzinfo
+) -> Tuple[Optional[T_LOCAL_TIME_STATUS], Tuple[datetime.timedelta, ...]]:
+    """Tells if `wall` is ambiguous, nonexistent or unique in `tz`, with its candidate offsets."""
+    offset_0, back_0 = _wall_clock_offset(wall, tz, 0)
+    offset_1, back_1 = _wall_clock_offset(wall, tz, 1)
+    if offset_0 == offset_1 and back_0 == wall:
+        # one offset, one reading: the wall clock maps to exactly one instant
+        return None, ()
+    # the instant read with `fold=0` is the written wall clock when the hour repeated; in the gap
+    # it lands outside of it and maps back to another wall clock. a zone switch that skips a day,
+    # like `Pacific/Apia` in 2011, also lands outside, so it is treated like the gap
+    if back_0 == wall:
+        # the earlier and the later reading of the repeated hour, in the order the wall clock
+        # occurred: `fold=0` first
+        return "ambiguous", (offset_0, offset_1)
+    # the offsets in force before and after the gap
+    return "nonexistent", (offset_0, offset_1)
+
+
+def resolve_local_time(
+    value: datetime.datetime, tz: datetime.tzinfo, policy: TAmbiguityPolicy
+) -> LocalTimeResolution:
+    """Resolves a local wall clock in `tz` to exactly one instant, per `policy`.
+
+    A wall clock the spring-forward gap skipped is nonexistent, one the fall-back hour repeated is
+    ambiguous. `policy` decides both: `reject` raises `InvalidLocalTime`, `earliest` and `latest`
+    pick one of the two offsets and `flag`, the default, does not raise but reports the status so
+    the normalizer can mark the row.
+
+    A naive value carries a `fold` too: `fold=1` selects the second offset of the repeated hour and
+    the offset in force after the gap, so a caller that already knows what the source meant is
+    honored. A value that is already aware keeps its offset as written.
+
+    The outcome depends only on the value and its IANA zone, never on the machine or the context
+    timezone, so a replay resolves every value the same way.
+
+    Args:
+        value: Datetime to resolve, naive or aware.
+        tz: IANA source zone declared for the field.
+        policy: One of `TIME_FIDELITY_AMBIGUITY_POLICIES`.
+
+    Returns:
+        The resolution with the offset, its status and the candidate offsets where they exist.
+
+    Raises:
+        InvalidLocalTime: `policy` is `reject` and the wall clock is ambiguous or nonexistent.
+    """
+    zone_name = to_iana_name(tz) or str(tz)
+    if (value_tz := value.tzinfo) is not None:
+        # the source wrote the offset out: the instant is known and the zone only names it, so
+        # there is nothing to resolve. an offset outside of the source zone is kept as written
+        labelled = value if _same_zone(value_tz, tz) else value.astimezone(tz)
+        return LocalTimeResolution(labelled, value.utcoffset(), None, ())
+
+    wall = value.replace(tzinfo=None)
+    status, candidate_offsets = _classify_wall_clock(wall, tz)
+    if status and policy == "reject":
+        raise InvalidLocalTime(wall, zone_name, status)
+
+    if status is None:
+        fold = value.fold
+    elif policy == "latest":
+        fold = 1
+    else:
+        # `flag` and `earliest` take the first reading of the repeated hour; the gap has no
+        # reading of its own and takes the offset in force before it
+        fold = 0
+    # an explicit fold in the value wins over the policy, the source may already know what it meant
+    fold = max(fold, value.fold)
+    offset, _ = _wall_clock_offset(wall, tz, fold)
+    return LocalTimeResolution(
+        wall.replace(fold=fold, tzinfo=tz), offset, status, candidate_offsets
+    )
+
+
+def format_utc_offset(offset: Optional[datetime.timedelta]) -> Optional[str]:
+    """Formats a UTC offset the way an ISO 8601 timestamp writes it, `+02:00` or `+00:19:32`.
+
+    Returns `None` for `None`, so an unresolved value has no offset.
+    """
+    if offset is None:
+        return None
+    total = int(offset.total_seconds())
+    sign = "-" if total < 0 else "+"
+    hours, remainder = divmod(abs(total), 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if seconds:
+        # historical local mean time offsets, ie. Amsterdam before 1937
+        return f"{sign}{hours:02d}:{minutes:02d}:{seconds:02d}"
+    return f"{sign}{hours:02d}:{minutes:02d}"
 
 
 class InvalidTimezoneName(TerminalValueError):

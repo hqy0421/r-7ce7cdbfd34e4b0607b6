@@ -19,7 +19,16 @@ from typing import (
 )
 
 from dlt.common.pendulum import pendulum
-from dlt.common.time import ensure_pendulum_datetime
+from dlt.common.time import (
+    C_TIME_STATUS_SUFFIX,
+    C_UTC_OFFSET_SUFFIX,
+    HINT_COMPANION_OF,
+    HINT_LOCAL_TIME_AMBIGUITY,
+    HINT_SOURCE_TIMEZONE,
+    TAmbiguityPolicy,
+    ensure_pendulum_datetime,
+    validate_ambiguity_policy,
+)
 from dlt.common import logger
 from dlt.common.json import json
 from dlt.common.data_types import TDataType
@@ -882,6 +891,76 @@ def get_active_record_timestamp(table: TTableSchema) -> Optional[pendulum.DateTi
     cname = get_first_column_name_with_prop(table, "x-active-record-timestamp")
     hint_val = table["columns"][cname]["x-active-record-timestamp"]  # type: ignore[typeddict-item]
     return None if hint_val is None else ensure_pendulum_datetime(hint_val)
+
+
+def get_time_fidelity(column: TColumnSchemaBase) -> Optional[Tuple[str, TAmbiguityPolicy]]:
+    """Source timezone and ambiguity policy declared for `column`.
+
+    Returns `None` when the column does not opt into the time fidelity mode, that is when
+    `x-source-timezone` is not set. The policy defaults to `flag` and is validated here.
+    """
+    source_timezone = column.get(HINT_SOURCE_TIMEZONE)  # type: ignore[typeddict-item]
+    if not source_timezone:
+        return None
+    policy = validate_ambiguity_policy(
+        column.get(HINT_LOCAL_TIME_AMBIGUITY)  # type: ignore[typeddict-item]
+    )
+    return source_timezone, policy
+
+
+def time_fidelity_companion_columns(
+    column_name: str, column: TColumnSchemaBase, naming: NamingConvention
+) -> Dict[str, TColumnSchema]:
+    """Columns that preserve what a time fidelity timestamp had to resolve, keyed by their suffix.
+
+    A field in the time fidelity mode gets a `text` column holding the UTC offset each value was
+    read with and, for the `flag` policy, another that marks a wall clock DST made ambiguous or
+    nonexistent. Both are named after the field, so they follow it through renames and remain
+    plain columns a destination can store.
+
+    The offset column always exists for such a field, so that a batch without any ambiguous value
+    produces the same schema as one with them and a replay does not depend on the batch contents.
+    """
+    fidelity = get_time_fidelity(column)
+    # only a timestamp field is resolved, so only it gets companions. an incomplete column has no
+    # data type yet and gets them once it is inferred
+    if fidelity is None or column.get("data_type") != "timestamp":
+        return {}
+    companions: Dict[str, TColumnSchema] = {
+        C_UTC_OFFSET_SUFFIX: {
+            "name": naming.shorten_fragments(column_name, C_UTC_OFFSET_SUFFIX),
+            "data_type": "text",
+            "nullable": True,
+            HINT_COMPANION_OF: column_name,
+        }
+    }
+    if fidelity[1] == "flag":
+        companions[C_TIME_STATUS_SUFFIX] = {
+            "name": naming.shorten_fragments(column_name, C_TIME_STATUS_SUFFIX),
+            "data_type": "text",
+            "nullable": True,
+            HINT_COMPANION_OF: column_name,
+        }
+    return companions
+
+
+def add_time_fidelity_companion_columns(
+    columns: TTableSchemaColumns, naming: NamingConvention
+) -> TTableSchemaColumns:
+    """Adds the companion columns of every time fidelity field in `columns`, in place.
+
+    The columns of a field follow it, so that a table declaring `x-source-timezone` on one of its
+    columns always carries the offset column and, for the `flag` policy, the status column.
+
+    Returns the columns that were added, so they can be reported in a schema update.
+    """
+    added: TTableSchemaColumns = {}
+    for column_name, column in list(columns.items()):
+        for companion in time_fidelity_companion_columns(column_name, column, naming).values():
+            if companion["name"] not in columns:
+                columns[companion["name"]] = companion
+                added[companion["name"]] = companion
+    return added
 
 
 def merge_schema_updates(schema_updates: Sequence[TSchemaUpdate]) -> TSchemaTables:

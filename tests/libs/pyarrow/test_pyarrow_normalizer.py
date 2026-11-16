@@ -16,13 +16,25 @@ from dlt.common.libs.pyarrow import (
     add_constant_column,
     add_dlt_load_id_column,
     InvalidTimezoneException,
+    offsets_to_iso,
+    resolve_arrow_time_fidelity,
 )
 from dlt.common.destination.configuration import ParquetFormatConfiguration
 
-from dlt.common.schema.utils import new_column, TColumnSchema
+from dlt.common.schema.utils import (
+    add_time_fidelity_companion_columns,
+    new_column,
+    TColumnSchema,
+)
 from dlt.common.schema.normalizers import configured_normalizers, import_normalizers
 from dlt.common.destination import DestinationCapabilitiesContext
-from dlt.common.time import set_context_timezone
+from dlt.common.time import (
+    InvalidLocalTime,
+    InvalidTimezoneName,
+    resolve_local_time,
+    set_context_timezone,
+    to_tzinfo,
+)
 
 
 def _normalize(item: Any, columns: List[TColumnSchema]) -> Any:
@@ -839,3 +851,308 @@ def test_normalize_preserves_null_columns_metadata(use_record_batch: bool) -> No
     assert b"dlt.null_columns" in result.schema.metadata
     stored_names = json.loadb(result.schema.metadata[b"dlt.null_columns"])
     assert stored_names == ["n1"]
+
+
+def _fidelity_columns(
+    policy: str = "flag", precision: Optional[int] = None, timezone: Optional[bool] = None
+) -> Dict[str, TColumnSchema]:
+    column: TColumnSchema = {
+        "name": "ts",
+        "data_type": "timestamp",
+        "x-source-timezone": "America/New_York",
+        "x-local-time-ambiguity": policy,
+    }
+    if precision is not None:
+        column["precision"] = precision
+    if timezone is not None:
+        column["timezone"] = timezone
+    columns = {"ts": column, "id": new_column("id", "bigint")}
+    add_time_fidelity_companion_columns(columns, _naming())
+    return columns
+
+
+def _naming() -> Any:
+    _, naming, _ = import_normalizers(configured_normalizers())
+    return naming
+
+
+def _fidelity_item(values: List[Optional[datetime]]) -> Any:
+    return pa.table(
+        {
+            "id": pa.array(range(len(values)), type=pa.int64()),
+            "ts": pa.array(values, type=pa.timestamp("us")),
+        }
+    )
+
+
+def test_resolve_arrow_time_fidelity_matches_fold_semantics() -> None:
+    # ambiguous wall clock: the earlier reading under earliest/flag, the later one under latest
+    wall = datetime(2024, 11, 3, 1, 30)
+    column = pa.array([wall], type=pa.timestamp("us"))
+
+    flag = resolve_arrow_time_fidelity(column, "America/New_York", "flag")
+    assert flag.instants[0].as_py() == datetime(2024, 11, 3, 5, 30, tzinfo=timezone.utc)
+    assert flag.offsets[0].as_py() == -4 * 3600
+    assert flag.statuses[0].as_py() == "ambiguous"
+    assert resolve_arrow_time_fidelity(column, "America/New_York", "earliest")[:2] == flag[:2]
+
+    latest = resolve_arrow_time_fidelity(column, "America/New_York", "latest")
+    assert latest.instants[0].as_py() == datetime(2024, 11, 3, 6, 30, tzinfo=timezone.utc)
+    assert latest.offsets[0].as_py() == -5 * 3600
+
+    with pytest.raises(InvalidLocalTime):
+        resolve_arrow_time_fidelity(column, "America/New_York", "reject")
+
+
+def test_resolve_arrow_time_fidelity_nonexistent() -> None:
+    # the gap: the earlier reading shifts the wall clock forward, as the object path does
+    column = pa.array([datetime(2024, 3, 10, 2, 30)], type=pa.timestamp("us"))
+    flag = resolve_arrow_time_fidelity(column, "America/New_York", "flag")
+    assert flag.instants[0].as_py() == datetime(2024, 3, 10, 7, 30, tzinfo=timezone.utc)
+    assert flag.offsets[0].as_py() == -5 * 3600
+    assert flag.statuses[0].as_py() == "nonexistent"
+
+    latest = resolve_arrow_time_fidelity(column, "America/New_York", "latest")
+    assert latest.instants[0].as_py() == datetime(2024, 3, 10, 6, 30, tzinfo=timezone.utc)
+
+    with pytest.raises(InvalidLocalTime) as exc_info:
+        resolve_arrow_time_fidelity(column, "America/New_York", "reject")
+    assert exc_info.value.status == "nonexistent"
+
+
+def test_resolve_arrow_time_fidelity_keeps_written_offset() -> None:
+    # an aware value already carries the offset the source wrote, the zone only names it
+    written = datetime(2024, 11, 3, 1, 30, tzinfo=timezone(timedelta(hours=5, minutes=30)))
+    column = pa.array([written], type=pa.timestamp("us", tz="Asia/Kolkata"))
+    resolution = resolve_arrow_time_fidelity(column, "America/New_York", "reject")
+    assert resolution.instants[0].as_py() == datetime(
+        2024, 11, 2, 20, 0, tzinfo=timezone.utc
+    )
+    assert resolution.offsets[0].as_py() == 5 * 3600 + 30 * 60
+    assert resolution.statuses[0].as_py() is None
+
+
+def test_resolve_arrow_time_fidelity_nulls() -> None:
+    column = pa.array([None, datetime(2024, 11, 3, 1, 30), None], type=pa.timestamp("us"))
+    resolution = resolve_arrow_time_fidelity(column, "America/New_York", "flag")
+    assert resolution.instants.to_pylist()[0] is None
+    assert resolution.instants.to_pylist()[2] is None
+    assert resolution.offsets.to_pylist() == [None, -4 * 3600, None]
+    assert resolution.statuses.to_pylist() == [None, "ambiguous", None]
+    # a policy that rejects passes on null-only input
+    resolve_arrow_time_fidelity(
+        pa.array([None], type=pa.timestamp("us")), "America/New_York", "reject"
+    )
+
+
+@pytest.mark.parametrize("source_tz", ["+02:00", "utc", "Mars/Olympus"])
+def test_resolve_arrow_time_fidelity_rejects_the_zones_the_object_path_rejects(
+    source_tz: str,
+) -> None:
+    # arrow reads a fixed offset such as `+02:00` as a zone of its own, the object path does not.
+    # a schema must not resolve on arrow data and fail on python objects
+    column = pa.array([datetime(2024, 6, 1, 12)], type=pa.timestamp("us"))
+    with pytest.raises(InvalidTimezoneName):
+        resolve_arrow_time_fidelity(column, source_tz, "flag")
+
+
+def test_resolve_arrow_time_fidelity_agrees_with_the_object_path_past_2038() -> None:
+    # arrow freezes the offset of a zone at the 32-bit epoch boundary, `zoneinfo` keeps following
+    # the zone, so the resolver corrects the wall clocks arrow cannot read and both paths agree
+    walls = [
+        datetime(2037, 12, 1, 12),
+        datetime(2040, 7, 1, 12),
+        datetime(2050, 1, 15, 12),
+        datetime(2050, 11, 6, 1, 30),
+        datetime(2050, 3, 13, 2, 30),
+    ]
+    tz = to_tzinfo("America/New_York")
+    arrow = resolve_arrow_time_fidelity(
+        pa.array(walls, type=pa.timestamp("us")), "America/New_York", "flag"
+    )
+    for i, wall in enumerate(walls):
+        expected = resolve_local_time(wall, tz, "flag")
+        assert arrow.instants[i].as_py() == expected.value.astimezone(timezone.utc)
+        assert arrow.offsets[i].as_py() == int(expected.offset.total_seconds())
+        assert arrow.statuses[i].as_py() == expected.status
+
+    # `reject` fails on the values DST broke past 2038 too
+    with pytest.raises(InvalidLocalTime) as exc_info:
+        resolve_arrow_time_fidelity(
+            pa.array([datetime(2050, 11, 6, 1, 30)], type=pa.timestamp("us")),
+            "America/New_York",
+            "reject",
+        )
+    assert exc_info.value.status == "ambiguous"
+
+
+def test_resolve_arrow_time_fidelity_aware_value_past_2038() -> None:
+    # an aware value names its instant, only the offset arrow reads the zone with is corrected
+    utc = datetime(2050, 7, 1, 16, tzinfo=timezone.utc)
+    column = pa.array([utc], type=pa.timestamp("us", tz="America/New_York"))
+    resolution = resolve_arrow_time_fidelity(column, "America/New_York", "flag")
+    assert resolution.instants[0].as_py() == utc
+    assert resolution.offsets[0].as_py() == -4 * 3600
+    assert resolution.statuses[0].as_py() is None
+
+
+def test_resolve_arrow_time_fidelity_is_replay_stable() -> None:
+    # the resolver reads every value on its own, so the result does not depend on the batch
+    walls = [
+        datetime(2024, 11, 3, 1, 30),
+        datetime(2024, 3, 10, 2, 30),
+        datetime(2024, 6, 1, 12, 0),
+    ]
+    whole = resolve_arrow_time_fidelity(
+        pa.array(walls, type=pa.timestamp("us")), "America/New_York", "flag"
+    )
+    for wall, instant, offset, status in zip(
+        walls, whole.instants.to_pylist(), whole.offsets.to_pylist(), whole.statuses.to_pylist()
+    ):
+        single = resolve_arrow_time_fidelity(
+            pa.array([wall], type=pa.timestamp("us")), "America/New_York", "flag"
+        )
+        assert single.instants[0].as_py() == instant
+        assert single.offsets[0].as_py() == offset
+        assert single.statuses[0].as_py() == status
+
+
+def test_offsets_to_iso() -> None:
+    offsets = pa.array([-4 * 3600, 7200, 0, None, 5 * 3600 + 30 * 60, -210], type=pa.int64())
+    assert offsets_to_iso(offsets).to_pylist() == [
+        "-04:00",
+        "+02:00",
+        "+00:00",
+        None,
+        "+05:30",
+        "-00:03:30",
+    ]
+    assert offsets_to_iso(pa.array([None], type=pa.int64())).to_pylist() == [None]
+
+
+def test_normalize_py_arrow_item_time_fidelity() -> None:
+    naming = _naming()
+    caps = DestinationCapabilitiesContext()
+    columns = _fidelity_columns(precision=3)
+    item = _fidelity_item(
+        [
+            datetime(2024, 11, 3, 1, 30, 0, 123456),
+            datetime(2024, 3, 10, 2, 30),
+            datetime(2024, 6, 1, 12, 0),
+            None,
+        ]
+    )
+
+    result = normalize_py_arrow_item(item, columns, naming, caps)
+    assert result.column_names == ["ts", "id", "ts__utc_offset", "ts__time_status"]
+    assert result.schema.field("ts").type == pa.timestamp("us", tz="UTC")
+    assert result.schema.field("ts__utc_offset").type == pa.string()
+    assert result.schema.field("ts__time_status").type == pa.string()
+
+    rows = result.to_pylist()
+    # the instant is truncated to the declared precision, like the object path
+    assert rows[0]["ts"] == datetime(2024, 11, 3, 5, 30, 0, 123000, tzinfo=timezone.utc)
+    assert rows[0]["ts__utc_offset"] == "-04:00"
+    assert rows[0]["ts__time_status"] == "ambiguous"
+    assert rows[1]["ts"] == datetime(2024, 3, 10, 7, 30, tzinfo=timezone.utc)
+    assert rows[1]["ts__utc_offset"] == "-05:00"
+    assert rows[1]["ts__time_status"] == "nonexistent"
+    assert rows[2]["ts"] == datetime(2024, 6, 1, 16, 0, tzinfo=timezone.utc)
+    assert rows[2]["ts__utc_offset"] == "-04:00"
+    assert rows[2]["ts__time_status"] is None
+    assert rows[3]["ts"] is None and rows[3]["ts__utc_offset"] is None
+
+
+def test_normalize_py_arrow_item_time_fidelity_precision() -> None:
+    naming = _naming()
+    caps = DestinationCapabilitiesContext()
+    columns = _fidelity_columns(precision=3)
+    item = _fidelity_item([datetime(2024, 6, 1, 12, 0, 0, 987654)])
+
+    result = normalize_py_arrow_item(item, columns, naming, caps)
+    assert result.to_pylist()[0]["ts"] == datetime(
+        2024, 6, 1, 16, 0, 0, 987000, tzinfo=timezone.utc
+    )
+
+
+def test_normalize_py_arrow_item_time_fidelity_naive_storage() -> None:
+    # a `timezone=False` column stores the wall clock of the storage timezone, like the object
+    # path does, and the offset companion still holds what the source wrote
+    naming = _naming()
+    caps = DestinationCapabilitiesContext()
+    columns = _fidelity_columns(timezone=False)
+    item = _fidelity_item([datetime(2024, 6, 1, 12, 0)])
+
+    result = normalize_py_arrow_item(item, columns, naming, caps, tz="Europe/Berlin")
+    assert result.schema.field("ts").type == pa.timestamp("us")
+    assert result.to_pylist()[0]["ts"] == datetime(2024, 6, 1, 18, 0)
+    assert result.to_pylist()[0]["ts__utc_offset"] == "-04:00"
+
+
+def test_normalize_py_arrow_item_time_fidelity_reject() -> None:
+    naming = _naming()
+    caps = DestinationCapabilitiesContext()
+    columns = _fidelity_columns(policy="reject")
+    item = _fidelity_item([datetime(2024, 11, 3, 1, 30)])
+    with pytest.raises(InvalidLocalTime):
+        normalize_py_arrow_item(item, columns, naming, caps)
+
+
+def test_normalize_py_arrow_item_time_fidelity_policies() -> None:
+    naming = _naming()
+    caps = DestinationCapabilitiesContext()
+    item = _fidelity_item([datetime(2024, 11, 3, 1, 30)])
+
+    earliest = normalize_py_arrow_item(item, _fidelity_columns("earliest"), naming, caps)
+    assert earliest.to_pylist()[0]["ts"] == datetime(2024, 11, 3, 5, 30, tzinfo=timezone.utc)
+    # `earliest` and `latest` do not mark the value
+    assert "ts__time_status" not in earliest.column_names
+
+    latest = normalize_py_arrow_item(item, _fidelity_columns("latest"), naming, caps)
+    assert latest.to_pylist()[0]["ts"] == datetime(2024, 11, 3, 6, 30, tzinfo=timezone.utc)
+
+
+def test_normalize_py_arrow_item_time_fidelity_does_not_depend_on_column_order() -> None:
+    # the companion column resolves whatever its position, even by the position it takes
+    # when it precedes its field
+    naming = _naming()
+    caps = DestinationCapabilitiesContext()
+    columns = _fidelity_columns()
+    reordered = {
+        "ts__time_status": columns["ts__time_status"],
+        "id": columns["id"],
+        "ts__utc_offset": columns["ts__utc_offset"],
+        "ts": columns["ts"],
+    }
+    item = _fidelity_item([datetime(2024, 11, 3, 1, 30)])
+
+    result = normalize_py_arrow_item(item, reordered, naming, caps)
+    assert result.column_names == ["ts__time_status", "id", "ts__utc_offset", "ts"]
+    row = result.to_pylist()[0]
+    assert row["ts"] == datetime(2024, 11, 3, 5, 30, tzinfo=timezone.utc)
+    assert row["ts__utc_offset"] == "-04:00"
+    assert row["ts__time_status"] == "ambiguous"
+
+
+def test_normalize_py_arrow_item_without_time_fidelity_is_unchanged() -> None:
+    # a column that does not declare a source timezone takes the regular path: no companions
+    naming = _naming()
+    caps = DestinationCapabilitiesContext()
+    columns = {"ts": {"name": "ts", "data_type": "timestamp"}, "id": new_column("id", "bigint")}
+    item = _fidelity_item([datetime(2024, 11, 3, 1, 30)])
+
+    result = normalize_py_arrow_item(item, columns, naming, caps)
+    assert result.column_names == ["ts", "id"]
+    assert result.to_pylist()[0]["ts"] == datetime(2024, 11, 3, 1, 30, tzinfo=timezone.utc)
+
+
+def test_should_normalize_arrow_schema_time_fidelity() -> None:
+    naming = _naming()
+    columns = _fidelity_columns()
+    # a column labelled UTC still needs work: the value resolves in its declared zone
+    item = pa.table({"ts": pa.array([datetime(2024, 6, 1, 12, 0)], type=pa.timestamp("us", "UTC"))})
+    assert should_normalize_arrow_schema(item.schema, {"ts": columns["ts"]}, naming)[0]
+    # while extracting nothing is resolved, so the same column is left alone
+    assert not should_normalize_arrow_schema(
+        item.schema, {"ts": columns["ts"]}, naming, resolve_time_fidelity=False
+    )[0]

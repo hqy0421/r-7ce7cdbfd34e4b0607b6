@@ -1,3 +1,4 @@
+from datetime import datetime, timezone
 from typing import Any, Iterator
 
 import pytest
@@ -5,11 +6,12 @@ import pytest
 from dlt.common.configuration.container import Container
 from dlt.common.destination import DestinationCapabilitiesContext
 from dlt.common.schema.schema import Schema
-from dlt.common.schema.utils import new_table
+from dlt.common.schema.utils import add_time_fidelity_companion_columns, new_table
 from dlt.common.storages import NormalizeStorage, ParsedLoadJobFileName
 
 from dlt.extract.extract import ExtractStorage
 from dlt.normalize import Normalize
+from dlt.normalize.exceptions import NormalizeJobFailed
 
 from dlt.destinations import duckdb
 
@@ -109,3 +111,83 @@ def test_normalize_empty_arrow_input_parquet_output(
     assert all(pyarrow.parquet.read_table(storage.make_full_path(f)).num_rows == 0 for f in files)
     step_info = raw_normalize.get_step_info(MockPipeline("arrow_parquet_pipeline", True))  # type: ignore[abstract]
     assert step_info.metrics[load_id][0]["table_metrics"]["items"].items_count == 0
+
+
+def _time_fidelity_schema(policy: str = "flag") -> Schema:
+    schema = Schema("arrow_time_fidelity")
+    columns = {
+        "ts": {
+            "name": "ts",
+            "data_type": "timestamp",
+            "nullable": True,
+            "x-source-timezone": "America/New_York",
+            "x-local-time-ambiguity": policy,
+        },
+        "id": {"name": "id", "data_type": "bigint", "nullable": True},
+    }
+    add_time_fidelity_companion_columns(columns, schema.naming)
+    schema.update_table(new_table("items", columns=list(columns.values())))
+    return schema
+
+
+def test_normalize_arrow_time_fidelity(
+    parquet_caps: DestinationCapabilitiesContext, raw_normalize: Normalize
+) -> None:
+    """The arrow path resolves a time fidelity field in its source zone and writes the original
+    offset and the ambiguity status next to the canonical instant."""
+    schema = _time_fidelity_schema()
+    # the source writes the wall clock of the repeated hour, without an offset
+    item = pyarrow.table(
+        {
+            "id": pyarrow.array([1, 2, 3], type=pyarrow.int64()),
+            "ts": pyarrow.array(
+                [
+                    datetime(2024, 11, 3, 1, 30),
+                    datetime(2024, 11, 3, 1, 30),
+                    None,
+                ],
+                type=pyarrow.timestamp("us"),
+            ),
+        }
+    )
+    load_id = extract_arrow_items(raw_normalize.normalize_storage, item, schema, "items")
+    normalize_pending(raw_normalize)
+
+    files = raw_normalize.load_storage.list_new_jobs(load_id)
+    assert {ParsedLoadJobFileName.parse(f).table_name for f in files} == {"items"}
+    storage = raw_normalize.load_storage.normalized_packages.storage
+    rows = [
+        row
+        for f in files
+        for row in pyarrow.parquet.read_table(storage.make_full_path(f)).to_pylist()
+    ]
+    assert [row["id"] for row in rows] == [1, 2, 3]
+    # the repeated hour is read with the earlier offset, as the object path does
+    assert rows[0]["ts"] == datetime(2024, 11, 3, 5, 30, tzinfo=timezone.utc)
+    assert rows[0]["ts__utc_offset"] == "-04:00"
+    assert rows[0]["ts__time_status"] == "ambiguous"
+    assert rows[2]["ts"] is None
+    assert rows[2]["ts__utc_offset"] is None
+
+    # the same schema reaches the load package
+    package_schema = raw_normalize.load_storage.normalized_packages.load_schema(load_id)
+    columns = package_schema.tables["items"]["columns"]
+    assert columns["ts"]["x-source-timezone"] == "America/New_York"
+    assert columns["ts__utc_offset"]["data_type"] == "text"
+    assert columns["ts__time_status"]["data_type"] == "text"
+
+
+def test_normalize_arrow_time_fidelity_reject(
+    parquet_caps: DestinationCapabilitiesContext, raw_normalize: Normalize
+) -> None:
+    schema = _time_fidelity_schema("reject")
+    item = pyarrow.table(
+        {
+            "id": pyarrow.array([1], type=pyarrow.int64()),
+            "ts": pyarrow.array([datetime(2024, 11, 3, 1, 30)], type=pyarrow.timestamp("us")),
+        }
+    )
+    load_id = extract_arrow_items(raw_normalize.normalize_storage, item, schema, "items")
+    with pytest.raises(NormalizeJobFailed) as exc_info:
+        normalize_pending(raw_normalize)
+    assert "is ambiguous" in str(exc_info.value)

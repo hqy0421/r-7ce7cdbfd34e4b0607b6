@@ -1,0 +1,155 @@
+{
+  "version": 1,
+  "version_hash": "IIK7bTnYba/o4QVIRXe5ZWwPHLpO2YK3b2ulROWQE7k=",
+  "engine_version": 11,
+  "name": "arrow_test",
+  "tables": {
+    "_dlt_version": {
+      "name": "_dlt_version",
+      "columns": {
+        "version": {
+          "name": "version",
+          "data_type": "bigint",
+          "nullable": false,
+          "description": "Numeric version of the schema, incremented on each schema change"
+        },
+        "engine_version": {
+          "name": "engine_version",
+          "data_type": "bigint",
+          "nullable": false,
+          "description": "Version of the dlt schema engine that created this schema"
+        },
+        "inserted_at": {
+          "name": "inserted_at",
+          "data_type": "timestamp",
+          "nullable": false,
+          "description": "Timestamp when this schema version was stored"
+        },
+        "schema_name": {
+          "name": "schema_name",
+          "data_type": "text",
+          "nullable": false,
+          "description": "Name of the schema"
+        },
+        "version_hash": {
+          "name": "version_hash",
+          "data_type": "text",
+          "nullable": false,
+          "description": "Unique hash of the schema content, used to detect changes"
+        },
+        "schema": {
+          "name": "schema",
+          "data_type": "text",
+          "nullable": false,
+          "description": "JSON representation of the complete schema definition"
+        }
+      },
+      "write_disposition": "skip",
+      "resource": "_dlt_version",
+      "description": "Created by DLT. Tracks schema updates"
+    },
+    "_dlt_loads": {
+      "name": "_dlt_loads",
+      "columns": {
+        "load_id": {
+          "name": "load_id",
+          "data_type": "text",
+          "nullable": false,
+          "precision": 64,
+          "description": "Unique identifier of the load operation"
+        },
+        "schema_name": {
+          "name": "schema_name",
+          "data_type": "text",
+          "nullable": true,
+          "description": "Name of the schema associated with this load"
+        },
+        "status": {
+          "name": "status",
+          "data_type": "bigint",
+          "nullable": false,
+          "description": "Status of the load operation (0 = success)"
+        },
+        "inserted_at": {
+          "name": "inserted_at",
+          "data_type": "timestamp",
+          "nullable": false,
+          "description": "Timestamp when the load was completed"
+        },
+        "schema_version_hash": {
+          "name": "schema_version_hash",
+          "data_type": "text",
+          "nullable": true,
+          "description": "Hash of the schema version used during this load"
+        }
+      },
+      "write_disposition": "skip",
+      "resource": "_dlt_loads",
+      "description": "Created by DLT. Tracks completed loads"
+    },
+    "events": {
+      "columns": {
+        "id": {
+          "name": "id",
+          "nullable": true,
+          "data_type": "bigint"
+        },
+        "ts": {
+          "name": "ts",
+          "nullable": true,
+          "data_type": "timestamp",
+          "x-source-timezone": "America/New_York",
+          "x-local-time-ambiguity": "flag"
+        },
+        "ts__utc_offset": {
+          "name": "ts__utc_offset",
+          "data_type": "text",
+          "nullable": true,
+          "x-time-fidelity-of": "ts"
+        },
+        "ts__time_status": {
+          "name": "ts__time_status",
+          "data_type": "text",
+          "nullable": true,
+          "x-time-fidelity-of": "ts"
+        }
+      },
+      "write_disposition": "append",
+      "name": "events",
+      "resource": "events"
+    }
+  },
+  "settings": {
+    "detections": [
+      "iso_timestamp"
+    ],
+    "default_hints": {
+      "not_null": [
+        "_dlt_id",
+        "_dlt_root_id",
+        "_dlt_parent_id",
+        "_dlt_list_idx",
+        "_dlt_load_id"
+      ],
+      "parent_key": [
+        "_dlt_parent_id"
+      ],
+      "root_key": [
+        "_dlt_root_id"
+      ],
+      "unique": [
+        "_dlt_id"
+      ],
+      "row_key": [
+        "_dlt_id"
+      ]
+    }
+  },
+  "normalizers": {
+    "names": "snake_case",
+    "json": {
+      "module": "dlt.common.normalizers.json.relational"
+    }
+  },
+  "previous_hashes": []
+}

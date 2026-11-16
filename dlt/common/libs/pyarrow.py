@@ -1,7 +1,7 @@
 import base64
 import gzip
 import uuid
-from datetime import time  # noqa: I251
+from datetime import datetime, time, timedelta, timezone  # noqa: I251
 from functools import lru_cache
 from typing import (
     Any,
@@ -25,8 +25,23 @@ from dlt.common import logger
 from dlt.common.json import json, custom_encode, map_nested_values_in_place
 from dlt.common.destination.capabilities import DestinationCapabilitiesContext
 from dlt.common.schema.typing import TColumnType
-from dlt.common.schema.utils import is_nullable_column, dlt_load_id_column
-from dlt.common.time import UTC_NAME, get_context_timezone_name, get_precision_from_datetime_unit
+from dlt.common.schema.utils import (
+    get_time_fidelity,
+    is_nullable_column,
+    dlt_load_id_column,
+    time_fidelity_companion_columns,
+)
+from dlt.common.time import (
+    C_UTC_OFFSET_SUFFIX,
+    HINT_COMPANION_OF,
+    UTC_NAME,
+    InvalidLocalTime,
+    format_utc_offset,
+    get_context_timezone_name,
+    get_precision_from_datetime_unit,
+    resolve_local_time,
+    to_tzinfo,
+)
 from dlt.common.typing import AnyType, StrStr, TFileOrPath, TDataItems
 from dlt.common.normalizers.naming import NamingConvention
 
@@ -527,10 +542,14 @@ def should_normalize_arrow_schema(
     naming: NamingConvention,
     caps: DestinationCapabilitiesContext = None,
     tz: str = None,
+    resolve_time_fidelity: bool = True,
 ) -> ArrowSchemaNormalizationResult:
     """Figure out if any of the normalization steps must be executed. This prevents
     from rewriting arrow tables when no changes are needed. Refer to `normalize_py_arrow_item`
     for a list of normalizations. Note that `column` must be already normalized.
+
+    `resolve_time_fidelity` is `False` while extracting, when a time fidelity column is not yet
+    resolved and must be kept exactly as the source wrote it.
     """
     schema, contains_null_cols = remove_null_columns_from_schema(schema)
 
@@ -549,7 +568,7 @@ def should_normalize_arrow_schema(
             nullable_updates[norm_name] = nullable_mapping[norm_name]
         # Detect arrow columns that require to be normalized
         if norm_name in columns and should_normalize_py_arrow_item_column(
-            columns[norm_name], field.type, tz, caps
+            columns[norm_name], field.type, tz, caps, resolve_time_fidelity
         ):
             column_cast[norm_name] = True
 
@@ -587,6 +606,7 @@ def normalize_py_arrow_item(
     naming: NamingConvention,
     caps: DestinationCapabilitiesContext,
     tz: str = None,
+    resolve_time_fidelity: bool = True,
 ) -> TAnyArrowItem:
     """Normalize arrow `item` schema according to the `columns`. Note that
     columns must be already normalized.
@@ -597,6 +617,11 @@ def normalize_py_arrow_item(
     3. empty columns will be inserted if they are missing, types will be generated using `caps`
     4. arrow columns with different nullability than corresponding schema columns will be updated
     5. timestamps will be normalized according to timezone flag in dlt column schema
+    6. columns of a field in the time fidelity mode will be resolved in their `x-source-timezone`
+       and its companion columns filled with the offset and the ambiguity status
+
+    `resolve_time_fidelity` is `False` while extracting: the value is written exactly as the
+    source wrote it and only the normalizer resolves it.
 
     NOTE: nullability is not enforced. it is up to destination to do that.
     """
@@ -604,10 +629,26 @@ def normalize_py_arrow_item(
     item = remove_null_columns(item)
     schema = item.schema
     should_normalize, rename_mapping, rev_mapping, nullable_updates, columns = (
-        should_normalize_arrow_schema(schema, columns, naming, caps, tz)
+        should_normalize_arrow_schema(schema, columns, naming, caps, tz, resolve_time_fidelity)
     )
     if not should_normalize:
         return item
+
+    # resolutions of the time fidelity fields, by their normalized name. resolved first, so that
+    # a companion column is filled whatever its position in `columns`
+    resolutions: Dict[str, ArrowLocalTimeResolution] = {}
+    if resolve_time_fidelity:
+        for column_name, column in columns.items():
+            fidelity = get_time_fidelity(column)
+            field_name = rev_mapping.get(column_name)
+            if fidelity is None or field_name is None:
+                continue
+            idx = schema.get_field_index(field_name)
+            if not pyarrow.types.is_timestamp(schema.field(idx).type):
+                continue
+            resolutions[column_name] = resolve_arrow_time_fidelity(
+                item.column(idx), fidelity[0], fidelity[1]
+            )
 
     new_fields = []
     new_columns = []
@@ -615,6 +656,17 @@ def normalize_py_arrow_item(
     for column_name, column in columns.items():
         # get original field name
         field_name = rev_mapping.pop(column_name, column_name)
+        if column.get(HINT_COMPANION_OF) in resolutions:
+            # the referent resolved, so the companion holds what it had to resolve
+            companion = time_fidelity_companion_values(column, columns, resolutions, naming)
+            if companion is not None:
+                new_fields.append(
+                    pyarrow.field(
+                        column_name, pyarrow.string(), nullable=is_nullable_column(column)
+                    )
+                )
+                new_columns.append(companion)
+                continue
         if field_name in rename_mapping:
             idx = schema.get_field_index(field_name)
             new_field = schema.field(idx).with_name(column_name)
@@ -622,10 +674,15 @@ def normalize_py_arrow_item(
                 # Set field nullable to match column
                 new_field = new_field.with_nullable(nullable_updates[column_name])
 
-            # coerce type
-            new_type, new_arrow_column = normalize_py_arrow_item_column(
-                column, new_field.type, item.column(idx), tz, caps
-            )
+            if (resolution := resolutions.get(column_name)) is not None:
+                new_type, new_arrow_column = time_fidelity_timestamp_column(
+                    column, new_field.type, resolution, tz, caps
+                )
+            else:
+                # coerce type
+                new_type, new_arrow_column = normalize_py_arrow_item_column(
+                    column, new_field.type, item.column(idx), tz, caps, resolve_time_fidelity
+                )
 
             # use renamed field
             new_fields.append(new_field.with_type(new_type))
@@ -653,11 +710,21 @@ def normalize_py_arrow_item(
     )
 
 
-def assume_arrow_timezone(arrow_column: pyarrow.Array, tz: str) -> pyarrow.Array:
-    """Labels a naive timestamp column with `tz` without shifting the values."""
+def assume_arrow_timezone(
+    arrow_column: pyarrow.Array,
+    tz: str,
+    ambiguous: str = "latest",
+    nonexistent: str = "latest",
+) -> pyarrow.Array:
+    """Labels a naive timestamp column with `tz` without shifting the values.
+
+    `ambiguous` and `nonexistent` are passed to `pyarrow.compute.assume_timezone` and tell how a
+    wall clock DST made ambiguous or nonexistent is read. Arrow collapses such a wall clock onto
+    the transition edge, so use `resolve_arrow_time_fidelity` when the wall clock must be kept.
+    """
     try:
         return pyarrow.compute.assume_timezone(
-            arrow_column, tz, ambiguous="latest", nonexistent="latest"
+            arrow_column, tz, ambiguous=ambiguous, nonexistent=nonexistent
         )
     except pyarrow.ArrowInvalid as inv_ex:
         if "timezone database" in str(inv_ex):
@@ -671,16 +738,439 @@ def validate_arrow_timezone(tz: str) -> None:
     assume_arrow_timezone(pyarrow.array([0], type=pyarrow.timestamp("s")), tz)
 
 
+@lru_cache(maxsize=None)
+def _validate_source_timezone(tz: str) -> None:
+    """Checks that `tz` is the IANA name the object path accepts as a source timezone.
+
+    Arrow reads a fixed offset such as `+02:00` as a timezone of its own while the object path
+    rejects it, so a zone declared with `x-source-timezone` must pass the same check on both
+    paths; otherwise the same schema would resolve on arrow data and fail on python objects.
+    """
+    to_tzinfo(tz)
+
+
+_TIME_FIDELITY_UNITS: Dict[str, int] = {"s": 1, "ms": 1_000, "us": 1_000_000, "ns": 1_000_000_000}
+"""`int64` ticks per second, per arrow timestamp unit."""
+
+
+class ArrowLocalTimeResolution(NamedTuple):
+    """Result of `resolve_arrow_time_fidelity`."""
+
+    instants: pyarrow.Array
+    """Instants in `arrow_column`'s unit, labelled `UTC`."""
+    offsets: pyarrow.Array
+    """UTC offset in seconds each value was read with, `int64`."""
+    statuses: pyarrow.Array
+    """`ambiguous`, `nonexistent` or null, per value."""
+
+
+def _seconds_to_iso(offset_seconds: int) -> str:
+    """Formats a UTC offset in seconds the way an ISO 8601 timestamp writes it."""
+    return format_utc_offset(timedelta(seconds=offset_seconds))
+
+
+def offsets_to_iso(offsets: pyarrow.Array) -> pyarrow.Array:
+    """Renders an `int64` array of UTC offsets in seconds as ISO 8601 offset strings."""
+    if isinstance(offsets, pyarrow.ChunkedArray):
+        # `StructArray` below takes plain arrays; offsets never straddle a chunk boundary
+        offsets = offsets.combine_chunks()
+    distinct = pyarrow.compute.drop_null(pyarrow.compute.unique(offsets)).to_pylist()
+    if not distinct:
+        return pyarrow.array([None] * len(offsets), type=pyarrow.string())
+    # one equality mask per offset, matched by `case_when`, so an arbitrary number of distinct
+    # offsets - historical zones change theirs many times - costs a pass each and no Python loop
+    conditions = pyarrow.StructArray.from_arrays(
+        [
+            pyarrow.compute.fill_null(
+                pyarrow.compute.equal(offsets, pyarrow.scalar(value, type=pyarrow.int64())), False
+            )
+            for value in distinct
+        ],
+        names=[str(i) for i in range(len(distinct))],
+    )
+    return pyarrow.compute.case_when(
+        conditions,
+        *[pyarrow.scalar(_seconds_to_iso(value), type=pyarrow.string()) for value in distinct],
+        pyarrow.scalar(None, type=pyarrow.string()),
+    )
+
+
+def _local_of_instant(
+    instants: pyarrow.Array, unit: str, source_tz: str
+) -> pyarrow.Array:
+    """Wall clock `instants` (an `int64` array) reads as in `source_tz`, as `int64`."""
+    aware = pyarrow.compute.cast(instants, pyarrow.timestamp(unit, UTC_NAME))
+    local = pyarrow.compute.local_timestamp(aware.cast(pyarrow.timestamp(unit, source_tz)))
+    return pyarrow.compute.cast(local, pyarrow.int64())
+
+
+def _classify_arrow_wall_clocks(
+    walls: pyarrow.Array, unit: str, source_tz: str
+) -> Tuple[pyarrow.Array, pyarrow.Array]:
+    """Splits naive `walls` (`int64` in `unit`) into ambiguous and nonexistent masks.
+
+    A wall clock is read with the offset in force a day before it and a day after it. For a
+    repeated hour those are the readings before and after the clock moved back, for the gap the
+    offsets before and after it moved forward and everywhere else the same one offset. An offset
+    is a candidate only when it maps the wall clock back to itself, which none does in the gap,
+    both do in the repeated hour and exactly one does everywhere else.
+    """
+    per_second = _TIME_FIDELITY_UNITS[unit]
+
+    def _offset_in_force(day_shift: int) -> pyarrow.Array:
+        # the offset in force reads a wall clock into an instant, and instant back into wall clock
+        shifted = pyarrow.compute.add(
+            walls, pyarrow.scalar(day_shift * 24 * 60 * 60 * per_second, pyarrow.int64())
+        )
+        return pyarrow.compute.subtract(_local_of_instant(shifted, unit, source_tz), shifted)
+
+    def _is_candidate(offset: pyarrow.Array) -> pyarrow.Array:
+        local = _local_of_instant(pyarrow.compute.subtract(walls, offset), unit, source_tz)
+        return pyarrow.compute.fill_null(pyarrow.compute.equal(local, walls), False)
+
+    before = _offset_in_force(-1)
+    after = _offset_in_force(1)
+    before_is_candidate = _is_candidate(before)
+    after_is_candidate = _is_candidate(after)
+    # a null wall clock is neither ambiguous nor nonexistent; `invert` alone would turn the
+    # null-propagated comparison below into true
+    present = pyarrow.compute.is_valid(walls)
+    ambiguous = pyarrow.compute.and_(
+        pyarrow.compute.and_(
+            before_is_candidate,
+            pyarrow.compute.and_(after_is_candidate, pyarrow.compute.not_equal(before, after)),
+        ),
+        present,
+    )
+    nonexistent = pyarrow.compute.and_(
+        pyarrow.compute.invert(pyarrow.compute.or_(before_is_candidate, after_is_candidate)),
+        present,
+    )
+    return ambiguous, nonexistent
+
+
+def _reading(
+    walls: pyarrow.Array,
+    unit: str,
+    source_tz: str,
+    day_shift: int,
+) -> pyarrow.Array:
+    """Offset `walls` are read with when the offset in force `day_shift` days away applies.
+
+    `0` is the offset in force at the wall clock itself, which reads a value that maps to one
+    instant correctly. Arrow collapses an ambiguous or nonexistent wall clock onto the transition,
+    so those take the reading of the day before or after it instead: `-1` is the offset before the
+    nearest transition, which `fold=0` selects, and `1` the offset after it, which `fold=1` does.
+    """
+    per_second = _TIME_FIDELITY_UNITS[unit]
+    shifted = pyarrow.compute.add(
+        walls, pyarrow.scalar(day_shift * 24 * 60 * 60 * per_second, pyarrow.int64())
+    )
+    resolved = pyarrow.compute.assume_timezone(
+        pyarrow.compute.cast(shifted, pyarrow.timestamp(unit)),
+        source_tz,
+        ambiguous="earliest",
+        nonexistent="earliest",
+    )
+    return pyarrow.compute.subtract(shifted, pyarrow.compute.cast(resolved, pyarrow.int64()))
+
+
+def resolve_arrow_time_fidelity(
+    arrow_column: pyarrow.Array,
+    source_tz: str,
+    policy: str,
+    ambiguous: Optional[pyarrow.Array] = None,
+    nonexistent: Optional[pyarrow.Array] = None,
+) -> ArrowLocalTimeResolution:
+    """Resolves a timestamp column in its declared source timezone, per `policy`.
+
+    Returns the canonical instant in the column's own unit, labelled `UTC`, the UTC offset in
+    seconds each value was read with and the `ambiguous`/`nonexistent` status of each wall clock.
+    The outcome depends only on the values and the declared zone, never on the context timezone
+    or on the batch composition, so a replay resolves every value the same way.
+
+    An aware value keeps the offset the source wrote out, exactly as on the object path, and is
+    never ambiguous or nonexistent.
+
+    Args:
+        arrow_column: Timestamp column, naive or aware.
+        source_tz: IANA zone the source writes naive values in.
+        policy: One of `TIME_FIDELITY_AMBIGUITY_POLICIES`.
+        ambiguous: Mask of the ambiguous wall clocks. Computed when not passed.
+        nonexistent: Mask of the nonexistent wall clocks. Computed when not passed.
+
+    Raises:
+        InvalidLocalTime: `policy` is `reject` and a wall clock is ambiguous or nonexistent.
+        InvalidTimezoneName: `source_tz` is not an IANA name the object path also accepts.
+    """
+    # both paths read the same declared zone, so they must accept the same names
+    _validate_source_timezone(source_tz)
+    unit = arrow_column.type.unit
+    per_second = _TIME_FIDELITY_UNITS[unit]
+    if arrow_column.type.tz is not None:
+        # the instant is known: the offset is the wall clock less the instant, which is the offset
+        # the source wrote out, and the declared zone only names it
+        instants = pyarrow.compute.cast(arrow_column, pyarrow.int64())
+        walls = pyarrow.compute.cast(pyarrow.compute.local_timestamp(arrow_column), pyarrow.int64())
+        offsets = pyarrow.compute.subtract(walls, instants)
+        if pyarrow.compute.any(_late_wall_clocks(instants, unit)).as_py():
+            # arrow freezes the offset of a zone past 2038, `zoneinfo` keeps following it
+            offsets = _correct_late_aware_values(instants, offsets, unit, arrow_column.type.tz)
+        return ArrowLocalTimeResolution(
+            pyarrow.compute.cast(instants, pyarrow.timestamp(unit, UTC_NAME)),
+            pyarrow.compute.cast(pyarrow.compute.divide(offsets, per_second), pyarrow.int64()),
+            pyarrow.array([None] * len(arrow_column), type=pyarrow.string()),
+        )
+
+    walls = pyarrow.compute.cast(arrow_column, pyarrow.int64())
+    if ambiguous is None or nonexistent is None:
+        computed_ambiguous, computed_nonexistent = _classify_arrow_wall_clocks(
+            walls, unit, source_tz
+        )
+        ambiguous = computed_ambiguous if ambiguous is None else ambiguous
+        nonexistent = computed_nonexistent if nonexistent is None else nonexistent
+    ambiguous = pyarrow.compute.fill_null(ambiguous, False)
+    nonexistent = pyarrow.compute.fill_null(nonexistent, False)
+
+    ambiguous_any = pyarrow.compute.any(ambiguous).as_py()
+    nonexistent_any = pyarrow.compute.any(nonexistent).as_py()
+
+    # the offset in force at the wall clock reads a value that maps to one instant. a wall clock
+    # DST broke is collapsed by arrow onto the transition, so it takes the reading of the day
+    # before: `fold=0` for the repeated hour and the offset that shifts the gap forward, the
+    # convention of the platforms dlt reads from
+    offsets = pyarrow.compute.if_else(
+        pyarrow.compute.or_(ambiguous, nonexistent),
+        _reading(walls, unit, source_tz, -1),
+        _reading(walls, unit, source_tz, 0),
+    )
+    if policy == "latest" and (ambiguous_any or nonexistent_any):
+        offsets = pyarrow.compute.if_else(
+            pyarrow.compute.or_(ambiguous, nonexistent),
+            _reading(walls, unit, source_tz, 1),
+            offsets,
+        )
+    statuses = pyarrow.compute.if_else(
+        ambiguous,
+        pyarrow.scalar("ambiguous", type=pyarrow.string()),
+        pyarrow.compute.if_else(
+            nonexistent, pyarrow.scalar("nonexistent", type=pyarrow.string()),
+            pyarrow.scalar(None, type=pyarrow.string()),
+        ),
+    )
+    # arrow reads a timezone past 2038 with the offset it had at the 32-bit epoch boundary, the
+    # object path keeps using the rules of the zone. only such wall clocks differ, so they are
+    # resolved with the stdlib rather than the arrow rules
+    if pyarrow.compute.any(_late_wall_clocks(walls, unit)).as_py():
+        offsets, statuses = _correct_late_wall_clocks(
+            walls, offsets, statuses, unit, source_tz, policy
+        )
+
+    if policy == "reject":
+        _raise_invalid_local_time(walls, unit, source_tz, statuses)
+
+    return ArrowLocalTimeResolution(
+        pyarrow.compute.cast(
+            pyarrow.compute.subtract(walls, offsets), pyarrow.timestamp(unit, UTC_NAME)
+        ),
+        pyarrow.compute.cast(pyarrow.compute.divide(offsets, per_second), pyarrow.int64()),
+        statuses,
+    )
+
+
+# the largest instant arrow reads a timezone rule for: it keeps the offset the zone had at the
+# int32 epoch boundary from then on, while `zoneinfo` keeps following the zone
+_ARROW_TIMEZONE_LAST_SECOND = 2**31 - 1
+
+
+def _late_wall_clocks(walls: pyarrow.Array, unit: str) -> pyarrow.Array:
+    """Masks the wall clocks arrow cannot read the timezone rules of, past 2038."""
+    per_second = _TIME_FIDELITY_UNITS[unit]
+    return pyarrow.compute.fill_null(
+        pyarrow.compute.greater_equal(
+            walls, pyarrow.scalar(_ARROW_TIMEZONE_LAST_SECOND * per_second, pyarrow.int64())
+        ),
+        False,
+    )
+
+
+def _ticks_to_datetime(ticks: int, unit: str) -> datetime:
+    """Converts `ticks` of `unit` since the epoch to a naive datetime, as arrow stores them."""
+    per_second = _TIME_FIDELITY_UNITS[unit]
+    seconds, remainder = divmod(ticks, per_second)
+    return datetime(1970, 1, 1) + timedelta(
+        seconds=seconds, microseconds=remainder * 1_000_000 // per_second
+    )
+
+
+def _correct_late_wall_clocks(
+    walls: pyarrow.Array,
+    offsets: pyarrow.Array,
+    statuses: pyarrow.Array,
+    unit: str,
+    source_tz: str,
+    policy: str,
+) -> Tuple[pyarrow.Array, pyarrow.Array]:
+    """Replaces the offsets and statuses of the wall clocks arrow reads past 2038 with `zoneinfo`.
+
+    Runs the object path `resolve_local_time` on those values, so a wall clock after 2038 resolves
+    exactly as it does when it arrives as a python object.
+    """
+    per_second = _TIME_FIDELITY_UNITS[unit]
+    tz = to_tzinfo(source_tz)
+    late = _late_wall_clocks(walls, unit)
+    corrected_offsets = []
+    corrected_statuses = []
+    for ticks in pyarrow.compute.filter(walls, late).to_pylist():
+        resolution = resolve_local_time(_ticks_to_datetime(ticks, unit), tz, policy)
+        corrected_offsets.append(int(resolution.offset.total_seconds()) * per_second)
+        corrected_statuses.append(resolution.status)
+    return (
+        pyarrow.compute.replace_with_mask(
+            offsets, late, pyarrow.array(corrected_offsets, type=pyarrow.int64())
+        ),
+        pyarrow.compute.replace_with_mask(
+            statuses, late, pyarrow.array(corrected_statuses, type=pyarrow.string())
+        ),
+    )
+
+
+def _correct_late_aware_values(
+    instants: pyarrow.Array, offsets: pyarrow.Array, unit: str, column_tz: str
+) -> pyarrow.Array:
+    """Recomputes, with `zoneinfo`, the offsets arrow derives for an aware value past 2038.
+
+    The instant an aware value holds is exact, arrow only freezes the offset it reads the zone
+    with, so replacing the offsets is enough.
+    """
+    per_second = _TIME_FIDELITY_UNITS[unit]
+    tz = to_tzinfo(column_tz)
+    late = _late_wall_clocks(instants, unit)
+    corrected = []
+    for instant in pyarrow.compute.filter(instants, late).to_pylist():
+        utc = _ticks_to_datetime(instant, unit).replace(tzinfo=timezone.utc)
+        corrected.append(int(utc.astimezone(tz).utcoffset().total_seconds()) * per_second)
+    return pyarrow.compute.replace_with_mask(
+        offsets, late, pyarrow.array(corrected, type=pyarrow.int64())
+    )
+
+
+def _raise_invalid_local_time(
+    walls: pyarrow.Array,
+    unit: str,
+    source_tz: str,
+    statuses: pyarrow.Array,
+) -> None:
+    """Raises `InvalidLocalTime` for the first wall clock DST made ambiguous or nonexistent."""
+    offending = pyarrow.compute.fill_null(
+        pyarrow.compute.is_in(
+            statuses, value_set=pyarrow.array(["ambiguous", "nonexistent"], type=pyarrow.string())
+        ),
+        False,
+    )
+    if not pyarrow.compute.any(offending).as_py():
+        return
+    index = pyarrow.compute.indices_nonzero(offending)[0].as_py()
+    wall = pyarrow.compute.cast(walls[index], pyarrow.timestamp(unit)).as_py()
+    raise InvalidLocalTime(wall, source_tz, statuses[index].as_py())
+
+
+_TIME_FIDELITY_FLOOR_UNITS: Dict[str, str] = {
+    "s": "second",
+    "ms": "millisecond",
+    "us": "microsecond",
+    "ns": "nanosecond",
+}
+"""`floor_temporal` unit of each arrow timestamp unit."""
+
+
+def _floor_timestamp_to_precision(instants: pyarrow.Array, precision: int) -> pyarrow.Array:
+    """Truncates `instants` to `precision` fractional seconds, like `reduce_datetime_precision`.
+
+    A precision finer than the column's unit cannot truncate anything and leaves the values as is.
+    """
+    per_second = _TIME_FIDELITY_UNITS[instants.type.unit]
+    ticks = per_second // 10**precision if 0 <= precision < 9 else 0
+    if ticks <= 0:
+        return instants
+    if ticks == per_second:
+        return pyarrow.compute.floor_temporal(instants, unit="second")
+    return pyarrow.compute.floor_temporal(
+        instants, unit=_TIME_FIDELITY_FLOOR_UNITS[instants.type.unit], multiple=ticks
+    )
+
+
+def time_fidelity_timestamp_column(
+    column: TColumnSchema,
+    arrow_type: pyarrow.DataType,
+    resolution: ArrowLocalTimeResolution,
+    tz: str,
+    caps: DestinationCapabilitiesContext = None,
+) -> Tuple[pyarrow.DataType, pyarrow.Array]:
+    """Value a time fidelity field stores: the canonical instant at the declared precision.
+
+    The instant is truncated to the `precision` hint and then labelled the way the `timezone` hint
+    and the destination capabilities ask, so a destination without tz support gets the wall clock
+    of the storage timezone, exactly as a value resolved on the object path.
+    """
+    unit = arrow_type.unit
+    values = resolution.instants
+    if (precision := column.get("precision")) is not None:
+        values = _floor_timestamp_to_precision(values, precision)
+    target_tz = get_column_timezone(column, tz, caps)
+    if target_tz is None:
+        if tz != UTC_NAME:
+            values = pyarrow.compute.cast(values, pyarrow.timestamp(unit, tz))
+        values = pyarrow.compute.local_timestamp(values)
+    else:
+        validate_arrow_timezone(target_tz)
+        values = pyarrow.compute.cast(values, pyarrow.timestamp(unit, target_tz))
+    return pyarrow.timestamp(unit, target_tz), values
+
+
+def time_fidelity_companion_values(
+    column: TColumnSchema,
+    columns: TTableSchemaColumns,
+    resolutions: Dict[str, ArrowLocalTimeResolution],
+    naming: NamingConvention,
+) -> Optional[pyarrow.Array]:
+    """Values of a companion column of a time fidelity field, `None` when it has none.
+
+    The offset column renders the offset each value was read with, the status column marks the
+    wall clocks DST made ambiguous or nonexistent.
+    """
+    referent_name = column.get(HINT_COMPANION_OF)
+    referent = columns.get(referent_name)
+    resolution = resolutions.get(referent_name)
+    if referent is None or resolution is None:
+        return None
+    companions = time_fidelity_companion_columns(referent_name, referent, naming)
+    for suffix, companion in companions.items():
+        if companion["name"] != column.get("name"):
+            continue
+        if suffix == C_UTC_OFFSET_SUFFIX:
+            return offsets_to_iso(resolution.offsets)
+        return resolution.statuses
+    return None
+
+
 def should_normalize_py_arrow_item_column(
     column: TColumnSchema,
     arrow_type: pyarrow.DataType,
     tz: str = None,
     caps: DestinationCapabilitiesContext = None,
+    resolve_time_fidelity: bool = True,
 ) -> bool:
     # Only handle timestamp columns
     if not pyarrow.types.is_timestamp(arrow_type):
         return False
     tz = tz or get_context_timezone_name()
+
+    # a time fidelity column always resolves in the normalizer: the instant is read in the
+    # declared source zone and the value truncated to the declared precision. while extracting it
+    # is written exactly as the source wrote it, so that the normalizer still sees its wall clock
+    if get_time_fidelity(column) is not None:
+        return bool(resolve_time_fidelity)
 
     # normalize if tz different
     return arrow_type.tz != get_column_timezone(column, tz, caps)  # type: ignore[no-any-return]
@@ -692,8 +1182,13 @@ def normalize_py_arrow_item_column(
     arrow_column: pyarrow.Array,
     tz: str = None,
     caps: DestinationCapabilitiesContext = None,
+    resolve_time_fidelity: bool = True,
 ) -> Tuple[pyarrow.DataType, pyarrow.Array]:
     """Normalize arrow timestamp column timezone according to dlt schema column convention.
+
+    A column declaring `x-source-timezone`, that is one in the time fidelity mode, additionally
+    has its values read in that zone and truncated to the `precision` hint. See
+    `resolve_arrow_time_fidelity`.
 
     Args:
         column: dlt column schema with timezone hint
@@ -701,12 +1196,22 @@ def normalize_py_arrow_item_column(
         arrow_column: actual PyArrow column data
         tz: timezone tz-aware columns are labelled with
         caps: destination capabilities, a destination without tz support gets naive columns
+        resolve_time_fidelity: resolve a time fidelity column when `True`, keep it as written
+            otherwise. Only the normalizer resolves
 
     Returns:
         Tuple of (modified_type, modified_column) or (arrow_field, arrow_column) if no changes needed
     """
     tz = tz or get_context_timezone_name()
-    if not should_normalize_py_arrow_item_column(column, arrow_type, tz, caps):
+    fidelity = get_time_fidelity(column) if resolve_time_fidelity else None
+    if fidelity is not None:
+        source_tz, policy = fidelity
+        resolution = resolve_arrow_time_fidelity(arrow_column, source_tz, policy)
+        return time_fidelity_timestamp_column(column, arrow_type, resolution, tz, caps)
+
+    if not should_normalize_py_arrow_item_column(
+        column, arrow_type, tz, caps, resolve_time_fidelity
+    ):
         return arrow_type, arrow_column
 
     unit = arrow_type.unit

@@ -265,10 +265,16 @@ class Extractor:
         # drop in next major version
         # TODO: drop in 2.0 also drop SCHEMA__USE_BREAK_PATH_ON_NORMALIZE
         root_table_schema["name"] = self._normalize_table_identifier(root_table_schema["name"])
-        return [
+        tables = [
             utils.normalize_table_identifiers(table_schema, self.naming)
             for table_schema in (root_table_schema, *nested_tables_schema)
         ]
+        for table_schema in tables:
+            # a field in the time fidelity mode gets its companion columns the moment it is
+            # declared, so the shape of the table does not depend on the values that a batch
+            # happens to hold and a replay writes the same columns
+            utils.add_time_fidelity_companion_columns(table_schema["columns"], self.naming)
+        return tables
 
     def _compute_and_update_tables(
         self, resource: DltResource, root_table_name: str, items: TDataItems, meta: Any
@@ -467,6 +473,9 @@ class ArrowExtractor(Extractor):
                 columns,
                 self.naming,
                 self._caps,
+                # a time fidelity value is resolved by the normalizer, from the wall clock the
+                # source wrote. relabelling it here would leave nothing to resolve
+                resolve_time_fidelity=False,
             )
             for item in items_list
         ]
@@ -565,6 +574,9 @@ class ArrowExtractor(Extractor):
                         " differences when loading. Change log level to INFO for more details."
                     )
                 utils.merge_columns(arrow_table["columns"], computed_table["columns"])
+                # the arrow schema only knows the fields it carries, so the companion columns a
+                # time fidelity field declared are added again on top of it
+                utils.add_time_fidelity_companion_columns(arrow_table["columns"], self.naming)
                 arrow_tables[computed_table["name"]] = arrow_table
 
         return list(arrow_tables.values())

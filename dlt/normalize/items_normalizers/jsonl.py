@@ -1,6 +1,7 @@
 from copy import copy
 from typing import List, Dict, Sequence, Set, Any, Optional, Tuple
 from functools import lru_cache
+import datetime
 
 from dlt.common.data_types.typing import TDataType
 from dlt.common.destination.capabilities import adjust_column_schema_to_capabilities
@@ -27,7 +28,16 @@ from dlt.common.schema import TSchemaUpdate, Schema
 from dlt.common.storages.load_storage import LoadStorage
 from dlt.common.storages import NormalizeStorage
 from dlt.common.storages.data_item_storage import DataItemStorage
-from dlt.common.time import normalize_timezone
+from dlt.common.time import (
+    C_TIME_STATUS_SUFFIX,
+    C_UTC_OFFSET_SUFFIX,
+    format_utc_offset,
+    normalize_timezone,
+    reduce_datetime_precision,
+    resolve_local_time,
+    to_py_datetime,
+    to_tzinfo,
+)
 from dlt.common.typing import VARIANT_FIELD_FORMAT, DictStrAny, REPattern, StrAny, TDataItem
 
 from dlt.common.runtime.collector import Collector, NULL_COLLECTOR
@@ -223,6 +233,53 @@ class JsonLItemsNormalizer(ItemsNormalizer):
             self._report_progress(table_name, count)
         return schema_update
 
+    def _normalize_plain_timestamp(
+        self, column: TColumnSchema, v: datetime.datetime
+    ) -> datetime.datetime:
+        """Puts `v` in the context timezone per the `timezone` hint and destination capabilities."""
+        timezone = (
+            self._timezone_override
+            if self._timezone_override is not None
+            else column.get("timezone", True)
+        )
+        return normalize_timezone(v, timezone)
+
+    def _resolve_time_fidelity(
+        self, column: TColumnSchema, v: Any
+    ) -> Optional[Tuple[datetime.datetime, Dict[str, Any]]]:
+        """Resolves `v` in the source timezone declared for `column`.
+
+        Returns the value `dlt` stores, that is the canonical instant in the storage timezone at
+        the declared precision, and the values of the companion columns keyed by their suffix.
+        Returns `None` when the column does not declare a source timezone or holds something
+        other than a timestamp after all, in which case the value takes the regular path,
+        variants included.
+
+        Raises:
+            InvalidLocalTime: The policy is `reject` and the wall clock is ambiguous or nonexistent.
+        """
+        if column.get("data_type") != "timestamp":
+            return None
+        fidelity = utils.get_time_fidelity(column)
+        if fidelity is None:
+            return None
+        py_type = self._py_type_to_sc_type(type(v))
+        if py_type != "timestamp":
+            try:
+                v = self._coerce_type("timestamp", py_type, v)
+            except (ValueError, SyntaxError):
+                return None
+        source_timezone, policy = fidelity
+        resolution = resolve_local_time(to_py_datetime(v), to_tzinfo(source_timezone), policy)
+        value = self._normalize_plain_timestamp(column, resolution.value)
+        if (precision := column.get("precision")) is not None:
+            # the instant is what storage holds, so that is what the declared precision truncates
+            value = reduce_datetime_precision(value, precision)
+        return value, {
+            C_UTC_OFFSET_SUFFIX: format_utc_offset(resolution.offset),
+            C_TIME_STATUS_SUFFIX: resolution.status,
+        }
+
     def _coerce_row(
         self, table_name: str, parent_table: str, row: StrAny
     ) -> Tuple[DictStrAny, TPartialTableSchema]:
@@ -247,8 +304,40 @@ class JsonLItemsNormalizer(ItemsNormalizer):
         type_map = self._type_map
         can_coerce_type = self._can_coerce_type
         coerce_type = self._coerce_type
-        tz_override = self._timezone_override
+
+        def _store_companions(
+            column_name: str, column: TColumnSchema, companions: Dict[str, Any]
+        ) -> None:
+            """Writes the values the time fidelity mode resolved and declares their columns."""
+            nonlocal updated_table_partial
+            fidelity_columns = utils.time_fidelity_companion_columns(
+                column_name, column, self.naming
+            )
+            if not fidelity_columns:
+                return
+            new_row.update(
+                {
+                    fidelity_columns[suffix]["name"]: companions[suffix]
+                    for suffix in fidelity_columns
+                    if companions.get(suffix) is not None
+                }
+            )
+            # the companions are part of the schema as soon as the field is, so that a batch
+            # without an ambiguous value produces the same columns as one with it
+            missing_columns = {
+                companion["name"]: companion
+                for companion in fidelity_columns.values()
+                if companion["name"] not in table_columns
+            }
+            if missing_columns:
+                if not updated_table_partial:
+                    updated_table_partial = copy(table)
+                    updated_table_partial["columns"] = {}
+                updated_table_partial["columns"].update(missing_columns)
+
         for col_name, v in row.items():
+            # companions hold the values of the columns the time fidelity mode adds to a field
+            companions: Dict[str, Any] = {}
             # skip None values, we should infer the types later
             if v is None:
                 # just check if column is nullable if it exists
@@ -257,18 +346,18 @@ class JsonLItemsNormalizer(ItemsNormalizer):
             else:
                 # fast path: known column with matching type
                 if existing_column := table_columns.get(col_name):
+                    if resolution := self._resolve_time_fidelity(existing_column, v):
+                        # the value comes from the source timezone declared for the column
+                        new_row[col_name] = resolution[0]
+                        _store_companions(col_name, existing_column, resolution[1])
+                        continue
                     if col_type := existing_column.get("data_type"):
                         py_type = type_map.get(type(v))
                         if py_type == col_type:
                             # happy path: complete column, type matches, no coercion needed
                             # NOTE: the timezone hint applies even when nothing is coerced
                             if col_type == "timestamp":
-                                timezone = (
-                                    tz_override
-                                    if tz_override is not None
-                                    else existing_column.get("timezone", True)
-                                )
-                                v = normalize_timezone(v, timezone)
+                                v = self._normalize_plain_timestamp(existing_column, v)
                             new_row[col_name] = v
                             continue
                         if py_type and can_coerce_type(col_type, py_type):
@@ -276,12 +365,7 @@ class JsonLItemsNormalizer(ItemsNormalizer):
                             try:
                                 new_v = coerce_type(col_type, py_type, v)
                                 if col_type == "timestamp":
-                                    timezone = (
-                                        tz_override
-                                        if tz_override is not None
-                                        else existing_column.get("timezone", True)
-                                    )
-                                    new_v = normalize_timezone(new_v, timezone)
+                                    new_v = self._normalize_plain_timestamp(existing_column, new_v)
                                 new_row[col_name] = new_v
                                 continue
                             except (ValueError, SyntaxError):
@@ -289,9 +373,14 @@ class JsonLItemsNormalizer(ItemsNormalizer):
                                 pass
                 # new column, incomplete column or variant
                 new_col_name, new_col_def, new_v = self._coerce_non_null_value(
-                    table_columns, table_name, col_name, v
+                    table_columns, table_name, col_name, v, companions=companions
                 )
                 new_row[new_col_name] = new_v
+                if companions:
+                    _store_companions(
+                        new_col_name, new_col_def or table_columns[new_col_name], companions
+                    )
+
             if new_col_def:
                 if not updated_table_partial:
                     # create partial table with only the new columns
@@ -356,6 +445,7 @@ class JsonLItemsNormalizer(ItemsNormalizer):
         col_name: str,
         v: Any,
         is_variant: bool = False,
+        companions: Dict[str, Any] = None,
     ) -> Tuple[str, TColumnSchema, Any]:
         new_column: TColumnSchema = None
         existing_column = table_columns.get(col_name)
@@ -400,7 +490,12 @@ class JsonLItemsNormalizer(ItemsNormalizer):
                         variant_col_name = old_complex_col_name
             # pass final=True so no more auto-variants can be created recursively
             return self._coerce_non_null_value(
-                table_columns, table_name, variant_col_name, v, is_variant=True
+                table_columns,
+                table_name,
+                variant_col_name,
+                v,
+                is_variant=True,
+                companions=companions,
             )
 
         # if coerced value is variant, then extract variant value
@@ -413,7 +508,12 @@ class JsonLItemsNormalizer(ItemsNormalizer):
                     col_name, VARIANT_FIELD_FORMAT % coerced_v[0]
                 )
                 return self._coerce_non_null_value(
-                    table_columns, table_name, variant_col_name, coerced_v[1], is_variant=True
+                    table_columns,
+                    table_name,
+                    variant_col_name,
+                    coerced_v[1],
+                    is_variant=True,
+                    companions=companions,
                 )
 
         if not existing_column:
@@ -432,12 +532,13 @@ class JsonLItemsNormalizer(ItemsNormalizer):
 
         # apply timestamp when column schema is known
         if col_type == "timestamp":
-            timezone = (
-                self._timezone_override
-                if self._timezone_override is not None
-                else (existing_column or new_column).get("timezone", True)
-            )
-            coerced_v = normalize_timezone(coerced_v, timezone)
+            column = existing_column or new_column
+            if (resolution := self._resolve_time_fidelity(column, coerced_v)) is not None:
+                # the source declared how its wall clock is read, `v` already holds the instant
+                coerced_v = resolution[0]
+                companions.update(resolution[1])
+            else:
+                coerced_v = self._normalize_plain_timestamp(column, coerced_v)
 
         return col_name, new_column, coerced_v
 

@@ -5,12 +5,19 @@ import pytest
 
 from dlt.common.schema import Schema
 from dlt.common.schema.typing import TColumnSchema, TTableSchema, TTableSchemaColumns
+from dlt.common.exceptions import ValueErrorWithKnownValues
+from dlt.common.schema.normalizers import configured_normalizers, import_normalizers
 from dlt.common.schema.utils import (
+    add_time_fidelity_companion_columns,
     exclude_dlt_entities,
+    get_time_fidelity,
+    time_fidelity_companion_columns,
     version_table,
     loads_table,
     pipeline_state_table,
+    new_column,
 )
+from dlt.common.time import HINT_COMPANION_OF
 from tests.common.utils import load_yml_case
 
 NAME_NORMALIZER_REFS = (
@@ -263,3 +270,62 @@ def test_internal_tables_column_descriptions_are_not_empty() -> None:
             assert (
                 col["description"] is not None and col["description"].strip() != ""
             ), f"Table {table_name}, column {col_name} has empty description"
+
+
+def test_get_time_fidelity() -> None:
+    assert get_time_fidelity(new_column("ts", "timestamp")) is None
+    column = new_column("ts", "timestamp")
+    column["x-source-timezone"] = "America/New_York"  # type: ignore[typeddict-unknown-key]
+    # the policy defaults to `flag`
+    assert get_time_fidelity(column) == ("America/New_York", "flag")
+    column["x-local-time-ambiguity"] = "latest"  # type: ignore[typeddict-unknown-key]
+    assert get_time_fidelity(column) == ("America/New_York", "latest")
+    column["x-local-time-ambiguity"] = "maybe"  # type: ignore[typeddict-unknown-key]
+    with pytest.raises(ValueErrorWithKnownValues):
+        get_time_fidelity(column)
+
+
+def test_time_fidelity_companion_columns() -> None:
+    _, naming, _ = import_normalizers(configured_normalizers())
+    column = new_column("event_ts", "timestamp")
+    column["x-source-timezone"] = "America/New_York"  # type: ignore[typeddict-unknown-key]
+
+    columns = time_fidelity_companion_columns("event_ts", column, naming)
+    # the offset column always exists, so the shape of the table does not depend on the values
+    assert set(columns) == {"utc_offset", "time_status"}
+    offset_col = columns["utc_offset"]
+    assert offset_col["name"] == "event_ts__utc_offset"
+    assert offset_col["data_type"] == "text"
+    assert offset_col["nullable"] is True
+    assert offset_col[HINT_COMPANION_OF] == "event_ts"
+    assert columns["time_status"]["name"] == "event_ts__time_status"
+
+    # a policy that picks one reading does not mark the value, so there is no status column
+    column["x-local-time-ambiguity"] = "earliest"  # type: ignore[typeddict-unknown-key]
+    assert set(time_fidelity_companion_columns("event_ts", column, naming)) == {"utc_offset"}
+
+    # a column outside of the mode gets none
+    assert time_fidelity_companion_columns("ts", new_column("ts", "timestamp"), naming) == {}
+
+
+def test_add_time_fidelity_companion_columns() -> None:
+    _, naming, _ = import_normalizers(configured_normalizers())
+    column = new_column("ts", "timestamp")
+    column["x-source-timezone"] = "America/New_York"  # type: ignore[typeddict-unknown-key]
+    columns = {"ts": column, "id": new_column("id", "bigint")}
+
+    added = add_time_fidelity_companion_columns(columns, naming)
+    assert set(added) == {"ts__utc_offset", "ts__time_status"}
+    assert list(columns) == ["ts", "id", "ts__utc_offset", "ts__time_status"]
+
+    # a second call adds nothing, so reading a table twice does not grow it
+    assert add_time_fidelity_companion_columns(columns, naming) == {}
+
+    # a field that is not a timestamp is not resolved, so it gets no companions
+    text_column = new_column("label", "text")
+    text_column["x-source-timezone"] = "America/New_York"  # type: ignore[typeddict-unknown-key]
+    assert time_fidelity_companion_columns("label", text_column, naming) == {}
+    # neither does an incomplete column, whose type is inferred later
+    incomplete = {"name": "ts"}  # type: ignore[var-annotated]
+    incomplete["x-source-timezone"] = "America/New_York"
+    assert time_fidelity_companion_columns("ts", incomplete, naming) == {}

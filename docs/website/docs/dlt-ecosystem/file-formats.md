@@ -93,6 +93,8 @@ Find more similar examples [here](../reference/performance.md#extract)
 
 `dlt` adds a timezone (UTC adjustment) to a timestamp column at every precision, from seconds to nanoseconds. `dlt` also creates TZ-aware timestamp columns in the destinations. [DuckDB is an exception here](./destinations/duckdb.md#supported-file-formats). A column with the `timezone` hint set to `False` stays naive, and the [context timezone](../general-usage/schema.md#context-timezone) decides which timezone `dlt` uses.
 
+A column in the [time fidelity mode](../general-usage/schema.md#time-fidelity-mode) is written the same way, with the canonical instant in it. The offset the source used and the DST status of the wall clock travel next to it, as `text` columns that both the jsonl and the parquet writers store unchanged.
+
 #### Disable timezones / UTC adjustment flags
 
 You can generate parquet files without timezone adjustment information in two ways:

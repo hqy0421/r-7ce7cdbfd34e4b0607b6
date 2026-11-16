@@ -3,6 +3,7 @@ import subprocess
 import sys
 import time
 from datetime import datetime, date, timezone, timedelta, time as dt_time  # noqa: I251
+from typing import Optional
 from unittest import mock
 from zoneinfo import ZoneInfo
 
@@ -10,6 +11,7 @@ import pytest
 from pendulum.tz import UTC, fixed_timezone
 
 from dlt.common import known_env, pendulum
+from dlt.common.exceptions import ValueErrorWithKnownValues
 from dlt.common.pendulum import ensure_pendulum_dt, to_pendulum_tz
 from dlt.common.storages.load_package import create_load_id
 from dlt.common.time import (
@@ -37,6 +39,12 @@ from dlt.common.time import (
     InvalidTimezoneName,
     datetime_obj_to_str,
     to_iana_name,
+    InvalidLocalTime,
+    TIME_FIDELITY_AMBIGUITY_POLICIES,
+    format_utc_offset,
+    resolve_local_time,
+    to_tzinfo,
+    validate_ambiguity_policy,
 )
 from dlt.common.typing import TAnyDateTime
 
@@ -1289,3 +1297,162 @@ def test_datetime_to_placeholders(moment: datetime, expected: str, as_pendulum: 
     assert " ".join(params[token] for token in tokens.split()) == expected
     assert params["curr_date"] == str(moment.date())
     assert params["timestamp"] == str(datetime_to_timestamp(moment))
+
+
+# time fidelity mode: a wall clock written without an offset is read in the declared source
+# zone. DST makes some of them ambiguous or nonexistent and `resolve_local_time` reads or
+# rejects them by policy, independently of the context timezone
+
+
+@pytest.mark.parametrize(
+    "wall,expected_offset",
+    [
+        # an ordinary wall clock maps to one instant
+        (datetime(2024, 6, 1, 12, 0), timedelta(hours=-4)),
+        (datetime(2024, 1, 15, 12, 0), timedelta(hours=-5)),
+        # a zone without DST
+        (datetime(2024, 6, 1, 12, 0), timedelta(0)),
+    ],
+    ids=["ny_summer", "ny_winter", "utc"],
+)
+def test_resolve_local_time_unique(wall: datetime, expected_offset: timedelta) -> None:
+    tz = "UTC" if expected_offset == timedelta(0) else "America/New_York"
+    resolution = resolve_local_time(wall, to_tzinfo(tz), "reject")
+    assert resolution.status is None
+    assert resolution.candidate_offsets == ()
+    assert resolution.offset == expected_offset
+    assert resolution.value.replace(tzinfo=None) == wall
+    assert resolution.value.utcoffset() == expected_offset
+
+
+def test_resolve_local_time_ambiguous() -> None:
+    # 01:30 happens twice when New York moves the clock back on 2024-11-03
+    wall = datetime(2024, 11, 3, 1, 30)
+    tz = to_tzinfo("America/New_York")
+
+    earliest = resolve_local_time(wall, tz, "earliest")
+    assert earliest.status == "ambiguous"
+    assert earliest.offset == timedelta(hours=-4)
+    assert earliest.value.astimezone(timezone.utc) == datetime(
+        2024, 11, 3, 5, 30, tzinfo=timezone.utc
+    )
+    # the default policy keeps the earlier reading and marks the value
+    flag = resolve_local_time(wall, tz, "flag")
+    assert flag == earliest
+    assert flag.candidate_offsets == (timedelta(hours=-4), timedelta(hours=-5))
+
+    latest = resolve_local_time(wall, tz, "latest")
+    assert latest.status == "ambiguous"
+    assert latest.offset == timedelta(hours=-5)
+    assert latest.value.astimezone(timezone.utc) == datetime(
+        2024, 11, 3, 6, 30, tzinfo=timezone.utc
+    )
+
+    with pytest.raises(InvalidLocalTime) as exc_info:
+        resolve_local_time(wall, tz, "reject")
+    assert exc_info.value.status == "ambiguous"
+    assert exc_info.value.tz == "America/New_York"
+    assert exc_info.value.value == wall
+
+
+def test_resolve_local_time_nonexistent() -> None:
+    # 02:30 never happens when New York moves the clock forward on 2024-03-10
+    wall = datetime(2024, 3, 10, 2, 30)
+    tz = to_tzinfo("America/New_York")
+
+    # the earlier offset is the one that shifts the wall clock forward, the convention of the
+    # platforms dlt reads from
+    flag = resolve_local_time(wall, tz, "flag")
+    assert flag.status == "nonexistent"
+    assert flag.offset == timedelta(hours=-5)
+    assert flag.value.astimezone(timezone.utc) == datetime(
+        2024, 3, 10, 7, 30, tzinfo=timezone.utc
+    )
+    assert resolve_local_time(wall, tz, "earliest") == flag
+
+    latest = resolve_local_time(wall, tz, "latest")
+    assert latest.offset == timedelta(hours=-4)
+    assert latest.value.astimezone(timezone.utc) == datetime(
+        2024, 3, 10, 6, 30, tzinfo=timezone.utc
+    )
+
+    with pytest.raises(InvalidLocalTime) as exc_info:
+        resolve_local_time(wall, tz, "reject")
+    assert exc_info.value.status == "nonexistent"
+
+
+def test_resolve_local_time_keeps_written_offset() -> None:
+    # an offset the source wrote out is kept as is: there is nothing to resolve
+    written = datetime(2024, 11, 3, 1, 30, tzinfo=timezone(timedelta(hours=5, minutes=30)))
+    resolution = resolve_local_time(written, to_tzinfo("America/New_York"), "reject")
+    assert resolution.status is None
+    assert resolution.offset == timedelta(hours=5, minutes=30)
+    assert resolution.value == written
+    assert resolution.candidate_offsets == ()
+
+    # a non-UTC offset and a DST-local wall clock
+    local = datetime(2024, 11, 3, 1, 30, tzinfo=ZoneInfo("America/New_York"))
+    since = resolve_local_time(local, to_tzinfo("America/New_York"), "reject")
+    assert since.status is None
+    assert since.offset == timedelta(hours=-4)
+
+
+def test_resolve_local_time_ignores_context_timezone() -> None:
+    wall = datetime(2024, 11, 3, 1, 30)
+    tz = to_tzinfo("America/New_York")
+    expected = resolve_local_time(wall, tz, "flag")
+    set_context_timezone(ZoneInfo("Asia/Tokyo"))
+    try:
+        assert resolve_local_time(wall, tz, "flag") == expected
+    finally:
+        set_context_timezone(ZoneInfo("UTC"))
+
+
+def test_resolve_local_time_thirty_minute_transition() -> None:
+    # Lord Howe Island moves its clock by thirty minutes
+    tz = to_tzinfo("Australia/Lord_Howe")
+    gap = resolve_local_time(datetime(2024, 10, 6, 2, 15), tz, "flag")
+    assert gap.status == "nonexistent"
+    assert gap.candidate_offsets == (timedelta(hours=10, minutes=30), timedelta(hours=11))
+    repeated = resolve_local_time(datetime(2024, 4, 7, 1, 45), tz, "flag")
+    assert repeated.status == "ambiguous"
+    assert repeated.candidate_offsets == (timedelta(hours=11), timedelta(hours=10, minutes=30))
+
+
+def test_resolve_local_time_skipped_day() -> None:
+    # Samoa skipped 2011-12-30 entirely when it moved across the date line
+    resolution = resolve_local_time(
+        datetime(2011, 12, 30, 12, 0), to_tzinfo("Pacific/Apia"), "flag"
+    )
+    assert resolution.status == "nonexistent"
+
+
+@pytest.mark.parametrize(
+    "offset,expected",
+    [
+        (timedelta(0), "+00:00"),
+        (timedelta(hours=2), "+02:00"),
+        (timedelta(hours=-5), "-05:00"),
+        (timedelta(hours=5, minutes=30), "+05:30"),
+        (timedelta(minutes=-3, seconds=-30), "-00:03:30"),
+        # historical local mean time offsets carry seconds
+        (timedelta(hours=0, minutes=19, seconds=32), "+00:19:32"),
+        (None, None),
+    ],
+    ids=["utc", "plus", "minus", "half", "seconds", "lmt", "none"],
+)
+def test_format_utc_offset(offset: Optional[timedelta], expected: Optional[str]) -> None:
+    assert format_utc_offset(offset) == expected
+
+
+@pytest.mark.parametrize("policy", TIME_FIDELITY_AMBIGUITY_POLICIES)
+def test_validate_ambiguity_policy(policy: str) -> None:
+    assert validate_ambiguity_policy(policy) == policy
+
+
+def test_validate_ambiguity_policy_defaults_and_rejects_unknown() -> None:
+    assert validate_ambiguity_policy(None) == "flag"
+    assert validate_ambiguity_policy("") == "flag"
+    with pytest.raises(ValueErrorWithKnownValues) as exc_info:
+        validate_ambiguity_policy("maybe")
+    assert exc_info.value.key == "x-local-time-ambiguity"

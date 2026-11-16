@@ -146,6 +146,8 @@ Data type information:
 
 When a column hint changes `data_type`, the `precision`, `scale`, `timezone`, and `x-nested-type` of the previous type are dropped. Changing between `decimal` and `wei` keeps `precision` and `scale`. Set them again in the same hint if the new type needs them.
 
+A `timestamp` column may also carry `x-source-timezone` and `x-local-time-ambiguity`, which turn on the [time fidelity mode](#time-fidelity-mode) for it.
+
 A column schema contains the following basic hints:
 
 1. `primary_key` marks a column as part of the primary key.
@@ -601,6 +603,93 @@ number of seconds stored in a column. The default value is 6 (microseconds) whic
 
 * you configure [parquet version](../dlt-ecosystem/file-formats.md#writer-settings) to **2.6**
 * you yield tabular data (arrow tables/pandas/polars). `dlt` coerces all Python datetime objects into `pendulum` with microsecond precision.
+
+### Time fidelity mode
+
+The rules above decide the instant. They do not keep how the source wrote that instant down. A
+source that writes a local wall clock without an offset, or with an offset that changes twice a
+year, loses that information when `dlt` stores the UTC instant. The time fidelity mode keeps it,
+per column. Opt a column in by declaring its source timezone:
+
+```py
+@dlt.resource(
+    name="events",
+    columns={
+        "occurred_at": {
+            "data_type": "timestamp",
+            # how the source writes a wall clock that carries no offset
+            "x-source-timezone": "America/New_York",
+            # what to do with a wall clock DST makes ambiguous or nonexistent
+            "x-local-time-ambiguity": "flag",
+            # the source stores whole seconds
+            "precision": 0,
+        }
+    },
+)
+def events():
+    yield {"occurred_at": "2024-11-03T01:30:00"}
+```
+
+The column still holds the canonical instant, normalized by the rules above. In addition, `dlt`
+adds the following `text` columns to the table and fills them from every value:
+
+| column                     | holds                                                                                         |
+| -------------------------- | --------------------------------------------------------------------------------------------- |
+| `occurred_at__utc_offset`  | the UTC offset the value was read with, for example `-04:00`                                  |
+| `occurred_at__time_status` | `ambiguous` or `nonexistent` when the wall clock fell into a DST transition, `NULL` otherwise |
+
+The status column comes with the `flag` policy, the default; a column that settles an ambiguous
+wall clock itself (`reject`, `earliest`, `latest`) gets only the offset column.
+
+With `occurred_at` written as `2024-11-03T01:30:00` and no offset, the repeated hour in
+`America/New_York` reads as `2024-11-03T05:30:00Z`, the offset is `-04:00` and the status
+`ambiguous`. A value the source writes **with** an offset keeps that offset: `dlt` never replaces
+it with the offset the declared zone has at that instant. The declared zone names the field and
+reads the values that carry no offset of their own. A tz-aware arrow column labels every value it
+holds with one zone, so an arrow value keeps the offset of that label and not one written per row;
+the jsonl path, which carries each offset, is exact for both.
+
+`x-source-timezone` must be a canonical IANA name, like the [context
+timezone](#context-timezone). A fixed offset such as `+02:00` is rejected on both the python and
+the arrow path: it says nothing about the DST transitions the mode is about.
+
+The offset column exists from the moment the field is declared, whatever a given batch holds, and
+so does the status column for `flag`. They belong to the field, so they appear in the same order on
+every replay and a batch without an ambiguous value produces the same table as one with them. They
+are new columns like any other, so a [`columns` contract](schema-contracts.md) that does not allow
+new columns rejects them: declare the source timezone before the table is created, or allow the
+columns to evolve once.
+
+#### Reading an ambiguous or nonexistent wall clock
+
+`x-local-time-ambiguity` decides how such a wall clock becomes an instant. It applies to python
+objects and to arrow/pandas/polars data, and to the columns declared above only; a column without
+`x-source-timezone` keeps the regular behavior.
+
+| policy     | behavior                                                                                             |
+| ---------- | ---------------------------------------------------------------------------------------------------- |
+| `flag`     | read with the offset in force before the transition and mark it in `__time_status`. **The default.** |
+| `reject`   | fail the normalize step with `InvalidLocalTime`.                                                     |
+| `earliest` | read with the offset in force before the transition, `2024-11-03T05:30:00Z`                          |
+| `latest`   | read with the offset in force after the transition, `2024-11-03T06:30:00Z`                           |
+
+In the spring-forward gap (`2024-03-10T02:30:00` does not exist in `America/New_York`), `flag`
+and `earliest` shift the wall clock forward over the gap, which stores `2024-03-10T07:30:00Z`, and
+`latest` reads it as `2024-03-10T06:30:00Z`.
+
+:::warning
+A wall clock that maps to one instant is never flagged: `x-local-time-ambiguity` is quiet for the
+rest of the year. Only a `reject` policy makes the whole column fail, and it fails on the values
+DST actually broke.
+:::
+
+The result depends only on the values and the declared zone, never on the [context
+timezone](#context-timezone), the system clock or the batch the value arrived in. Replaying a
+batch, or splitting it differently, resolves every value the same way.
+
+The mode is opt-in per column and is never inferred from the data: `dlt` generates the companion
+columns only for a column whose schema declares `x-source-timezone`. Every other column keeps the
+default timestamp handling described above.
 
 ### Handling nulls
 

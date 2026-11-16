@@ -137,6 +137,9 @@ _ColumnPropInfos = [
     # any x- hint with special settings ie. defaults
     TColumnPropInfo("x-active-record-timestamp", (), is_hint=True),  # no default values
     TColumnPropInfo("x-nested-type", type_modifier=True),
+    # time fidelity mode, see `dlt.common.time.resolve_local_time`
+    TColumnPropInfo("x-source-timezone", (None,)),
+    TColumnPropInfo("x-local-time-ambiguity", ("flag", None)),
 ]
 
 ColumnPropInfos: Dict[Union[TColumnProp, str], TColumnPropInfo] = {

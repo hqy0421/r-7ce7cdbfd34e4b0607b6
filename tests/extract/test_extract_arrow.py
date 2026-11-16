@@ -5,6 +5,7 @@ and does not produce mixed normalized/non-normalized identifiers in the schema.
 """
 
 import os
+from datetime import datetime
 from typing import Any, List
 
 import pyarrow as pa
@@ -357,3 +358,58 @@ def test_pydantic_validator_passes_through_non_object_items() -> None:
     # unknown non-dict object raises the original pydantic ValidationError
     with pytest.raises(ValidationError, match="model_type"):
         validator(42)
+
+
+def test_arrow_time_fidelity_columns_declared_and_unresolved(extract_step: Extract) -> None:
+    """A time fidelity field gets its companion columns when declared, and extraction keeps the
+    wall clock the source wrote so the normalizer can resolve it."""
+    table = pa.table(
+        {
+            "id": pa.array([1], type=pa.int64()),
+            # a local wall clock in the repeated hour, as the source wrote it
+            "ts": pa.array([datetime(2024, 11, 3, 1, 30)], type=pa.timestamp("us")),
+        }
+    )
+
+    @dlt.resource(
+        name="events",
+        columns={
+            "ts": {
+                "data_type": "timestamp",
+                "x-source-timezone": "America/New_York",
+                "x-local-time-ambiguity": "flag",
+            }
+        },
+    )
+    def events_resource():
+        yield table
+
+    source = DltSource(dlt.Schema("arrow_test"), "module", [events_resource])
+    extract_step.extract(source, 20, 1)
+    # committing the package needs the schema in the storage, as the pipeline does
+    extract_step.schema_storage.save_schema(source.schema)
+    extract_step.commit_packages()
+
+    # the companions exist from the declaration, before any value is read
+    columns = source.schema.tables["events"]["columns"]
+    assert columns["ts__utc_offset"]["data_type"] == "text"
+    assert columns["ts__utc_offset"]["x-time-fidelity-of"] == "ts"
+    assert columns["ts__time_status"]["data_type"] == "text"
+    assert columns["ts"]["x-source-timezone"] == "America/New_York"
+
+    # the extracted file still holds the naive wall clock: resolution belongs to the normalizer
+    files = [
+        f
+        for f in extract_step.extract_storage.list_files_to_normalize_sorted()
+        if f.endswith(".parquet")
+    ]
+    assert len(files) == 1
+    with extract_step.extract_storage.extracted_packages.storage.open_file(files[0], "rb") as f:
+        extracted = pa.parquet.read_table(f)
+    ts_field = extracted.schema.field("ts")
+    assert pa.types.is_timestamp(ts_field.type)
+    assert ts_field.type.tz is None
+    assert extracted["ts"].to_pylist() == [datetime(2024, 11, 3, 1, 30)]
+    # the companions are written but left empty: the normalizer derives them from the wall clock
+    assert extracted["ts__utc_offset"].to_pylist() == [None]
+    assert extracted["ts__time_status"].to_pylist() == [None]
